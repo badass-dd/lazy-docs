@@ -2,9 +2,9 @@
 
 namespace Badass\ControllerPhpDocGenerator\Commands;
 
+use Badass\ControllerPhpDocGenerator\ControllerDocBlockGenerator;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
-use Badass\ControllerPhpDocGenerator\ControllerDocBlockGenerator;
 use ReflectionClass;
 use ReflectionMethod;
 
@@ -14,11 +14,11 @@ class GenerateControllerDocsCommand extends Command
                             {controller? : Controller class or path}
                             {--method= : Specific method name to generate}
                             {--all : Generate for all controllers}
-                            {--overwrite : Overwrite existing PHPDoc blocks}
+                            {--overwrite : Process methods that already have PHPDoc (replaces existing)}
                             {--dry-run : Preview changes without writing}
                             {--force : Include simple methods}';
 
-    protected $description = 'Generate intelligent PHPDoc for Laravel API controllers';
+    protected $description = 'Generate intelligent PHPDoc for Laravel API controllers. Use PHP comments /* */ above PHPDoc blocks for developer notes that persist across regenerations.';
 
     public function handle(): int
     {
@@ -33,8 +33,9 @@ class GenerateControllerDocsCommand extends Command
         }
 
         $controller = $this->argument('controller');
-        if (!$controller) {
+        if (! $controller) {
             $this->error('❌ Please provide controller name or use --all flag');
+
             return 1;
         }
 
@@ -56,10 +57,11 @@ class GenerateControllerDocsCommand extends Command
 
         if (empty($files)) {
             $this->error('❌ No controller files found.');
+
             return 1;
         }
 
-        $this->info("📁 Found " . count($files) . " controller(s)");
+        $this->info('📁 Found '.count($files).' controller(s)');
         $this->newLine();
 
         $stats = [
@@ -79,12 +81,12 @@ class GenerateControllerDocsCommand extends Command
 
         $this->newLine();
         $this->info('✅ Complete!');
-        $this->line('   Files processed: ' . $stats['files_processed']);
-        $this->line('   Methods documented: ' . $stats['methods_documented']);
-        $this->line('   Complex methods: ' . $stats['complex_methods']);
+        $this->line('   Files processed: '.$stats['files_processed']);
+        $this->line('   Methods documented: '.$stats['methods_documented']);
+        $this->line('   Complex methods: '.$stats['complex_methods']);
 
         if ($stats['skipped'] > 0) {
-            $this->line('   Methods skipped: ' . $stats['skipped']);
+            $this->line('   Methods skipped: '.$stats['skipped']);
         }
 
         if ($this->option('dry-run')) {
@@ -104,8 +106,9 @@ class GenerateControllerDocsCommand extends Command
     {
         $filePath = $this->resolveControllerPath($controller);
 
-        if (!$filePath || !file_exists($filePath)) {
+        if (! $filePath || ! file_exists($filePath)) {
             $this->error("❌ Controller not found: {$controller}");
+
             return 1;
         }
 
@@ -113,6 +116,7 @@ class GenerateControllerDocsCommand extends Command
 
         if ($result['methods'] === 0) {
             $this->warn('⚠️  No methods were documented');
+
             return 0;
         }
 
@@ -134,15 +138,17 @@ class GenerateControllerDocsCommand extends Command
     {
         $filePath = $this->resolveControllerPath($controller);
 
-        if (!$filePath || !file_exists($filePath)) {
+        if (! $filePath || ! file_exists($filePath)) {
             $this->error("❌ Controller not found: {$controller}");
+
             return 1;
         }
 
         $className = $this->getClassNameFromFile($filePath);
 
-        if (!$className) {
+        if (! $className) {
             $this->error("❌ Could not determine class: {$filePath}");
+
             return 1;
         }
 
@@ -150,24 +156,35 @@ class GenerateControllerDocsCommand extends Command
             $reflection = new ReflectionClass($className);
         } catch (\Throwable $e) {
             $this->error("❌ Reflection failed: {$className}");
+
             return 1;
         }
 
-        if (!$reflection->hasMethod($methodName)) {
+        if (! $reflection->hasMethod($methodName)) {
             $this->error("❌ Method not found: {$className}::{$methodName}");
+
             return 1;
         }
 
         $method = $reflection->getMethod($methodName);
 
-        if (!$method->isPublic()) {
+        if (! $method->isPublic()) {
             $this->error("❌ Method is not public: {$methodName}");
+
             return 1;
         }
 
         $this->line("📄 <fg=cyan>{$className}</>:<fg=cyan>{$methodName}</>");
 
         $content = File::get($filePath);
+
+        // Check if method already has PHPDoc and --overwrite not specified
+        if (! $this->shouldGenerateDoc($content, $method) && ! $this->option('overwrite')) {
+            $this->warn("   ⊘ Method already has PHPDoc. Use --overwrite to replace.");
+
+            return 0;
+        }
+
         $modified = false;
 
         try {
@@ -176,7 +193,7 @@ class GenerateControllerDocsCommand extends Command
             $complexity = $generator->metadata['complexity_score'];
 
             $this->line("   Complexity: <fg=yellow>{$complexity}/30</>");
-            $this->line("   <fg=green>Generated PHPDoc:</>", 'v');
+            $this->line('   <fg=green>Generated PHPDoc:</>', 'v');
             $this->line('');
 
             // Display generated PHPDoc
@@ -186,17 +203,18 @@ class GenerateControllerDocsCommand extends Command
 
             $this->newLine();
 
-            if (!$this->option('dry-run')) {
+            if (! $this->option('dry-run')) {
                 $content = $this->injectPhpDoc($content, $methodName, $phpDoc);
                 File::put($filePath, $content);
-                $this->line("   <fg=green>✓ Saved to file</>");
+                $this->line('   <fg=green>✓ Saved to file</>');
                 $modified = true;
             } else {
-                $this->line("   <fg=yellow>[DRY RUN] - Not written</>");
+                $this->line('   <fg=yellow>[DRY RUN] - Not written</>');
             }
 
         } catch (\Throwable $e) {
             $this->error("❌ Error: {$e->getMessage()}");
+
             return 1;
         }
 
@@ -217,8 +235,9 @@ class GenerateControllerDocsCommand extends Command
     {
         $className = $this->getClassNameFromFile($filePath);
 
-        if (!$className) {
+        if (! $className) {
             $this->warn("⚠️  Could not determine class: {$filePath}");
+
             return ['files' => 0, 'methods' => 0, 'complex' => 0, 'skipped' => 0];
         }
 
@@ -226,6 +245,7 @@ class GenerateControllerDocsCommand extends Command
             $reflection = new ReflectionClass($className);
         } catch (\Throwable $e) {
             $this->warn("⚠️  Reflection failed: {$className}");
+
             return ['files' => 0, 'methods' => 0, 'complex' => 0, 'skipped' => 0];
         }
 
@@ -244,18 +264,20 @@ class GenerateControllerDocsCommand extends Command
                 continue;
             }
 
-            if (!$this->shouldGenerateDoc($content, $method) && !$this->option('overwrite')) {
+            if (! $this->shouldGenerateDoc($content, $method) && ! $this->option('overwrite')) {
                 $this->line("   ⊘ <fg=gray>{$method->getName()}</> (already documented)");
                 $skipped++;
+
                 continue;
             }
 
             $generator = new ControllerDocBlockGenerator($className, $method->getName());
             $complexity = $generator->metadata['complexity_score'];
 
-            if ($complexity < 5 && !$this->option('force')) {
+            if ($complexity < 5 && ! $this->option('force')) {
                 $this->line("   ⏭️  <fg=gray>{$method->getName()}</> (simple, complexity: {$complexity})");
                 $skipped++;
+
                 continue;
             }
 
@@ -272,20 +294,20 @@ class GenerateControllerDocsCommand extends Command
             }
         }
 
-        if ($modified && !$this->option('dry-run')) {
+        if ($modified && ! $this->option('dry-run')) {
             File::put($filePath, $content);
-            $this->line("   <fg=green>✓ Saved</>");
+            $this->line('   <fg=green>✓ Saved</>');
         }
 
         if ($modified && $this->option('dry-run')) {
-            $this->line("   <fg=yellow>[DRY RUN]</>");
+            $this->line('   <fg=yellow>[DRY RUN]</>');
         }
 
         return [
             'files' => $modified ? 1 : 0,
             'methods' => $methodCount,
             'complex' => $complexCount,
-            'skipped' => $skipped
+            'skipped' => $skipped,
         ];
     }
 
@@ -296,14 +318,14 @@ class GenerateControllerDocsCommand extends Command
     {
         $path = app_path('Http/Controllers');
 
-        if (!is_dir($path)) {
+        if (! is_dir($path)) {
             return [];
         }
 
         return collect(File::allFiles($path))
-            ->filter(fn($file) => $file->getExtension() === 'php')
-            ->filter(fn($file) => str_contains($file->getFilename(), 'Controller'))
-            ->map(fn($file) => $file->getRealPath())
+            ->filter(fn ($file) => $file->getExtension() === 'php')
+            ->filter(fn ($file) => str_contains($file->getFilename(), 'Controller'))
+            ->map(fn ($file) => $file->getRealPath())
             ->values()
             ->all();
     }
@@ -319,13 +341,13 @@ class GenerateControllerDocsCommand extends Command
         }
 
         // Try as file in app/Http/Controllers
-        $filePath = app_path('Http/Controllers/' . str_replace('\\', '/', $controller) . '.php');
+        $filePath = app_path('Http/Controllers/'.str_replace('\\', '/', $controller).'.php');
         if (file_exists($filePath)) {
             return $filePath;
         }
 
         // Try with Controller suffix
-        $filePath = app_path('Http/Controllers/' . str_replace('\\', '/', $controller) . 'Controller.php');
+        $filePath = app_path('Http/Controllers/'.str_replace('\\', '/', $controller).'Controller.php');
         if (file_exists($filePath)) {
             return $filePath;
         }
@@ -349,6 +371,7 @@ class GenerateControllerDocsCommand extends Command
         }
 
         $excluded = config('phpdoc-generator.exclude_methods', []);
+
         return in_array($name, $excluded);
     }
 
@@ -357,34 +380,44 @@ class GenerateControllerDocsCommand extends Command
      */
     private function shouldGenerateDoc(string $content, ReflectionMethod $method): bool
     {
-        $pattern = '/\/\*\*.*?\*\/\s+(?:public|protected|private).*?' . preg_quote($method->getName()) . '\s*\(/s';
-        return !preg_match($pattern, $content);
+        $pattern = '/\/\*\*.*?\*\/\s+(?:public|protected|private).*?'.preg_quote($method->getName()).'\s*\(/s';
+
+        return ! preg_match($pattern, $content);
     }
 
     /**
      * Inject PHPDoc into content
+     *
+     * @param  string  $content  File content
+     * @param  string  $methodName  Method name
+     * @param  string  $phpDoc  New PHPDoc to inject
      */
     private function injectPhpDoc(string $content, string $methodName, string $phpDoc): string
     {
-        $pattern = '/(?=(?:public|protected|private)(?:\s+(?:static|abstract))?\s+(?:function\s+)?' . preg_quote($methodName) . '\s*\()/';
+        $pattern = '/(?=(?:public|protected|private)(?:\s+(?:static|abstract))?\s+(?:function\s+)?'.preg_quote($methodName).'\s*\()/';
 
-        if (!preg_match($pattern, $content, $matches, PREG_OFFSET_CAPTURE)) {
+        if (! preg_match($pattern, $content, $matches, PREG_OFFSET_CAPTURE)) {
             return $content;
         }
 
         $offset = $matches[0][1];
-        $beforeMethod = substr($content, max(0, $offset - 500), $offset);
+        $beforeMethod = substr($content, max(0, $offset - 2000), min($offset, 2000));
 
-        if (preg_match('/\/\*\*.*?\*\/\s*$/is', $beforeMethod)) {
+        // Check if there's an existing PHPDoc block before the method
+        if (preg_match('/\/\*\*.*?\*\/\s*$/is', $beforeMethod, $docMatch)) {
+            // Replace existing PHPDoc
             $newContent = preg_replace(
-                '/\/\*\*.*?(?=(?:public|protected|private)(?:\s+(?:static|abstract))?\s+(?:function\s+)?' . preg_quote($methodName) . '\s*\()/is',
-                $phpDoc . "\n    ",
-                $content
+                '/\/\*\*.*?\*\/\s*(?=(?:public|protected|private)(?:\s+(?:static|abstract))?\s+(?:function\s+)?'.preg_quote($methodName).'\s*\()/is',
+                $phpDoc."\n    ",
+                $content,
+                1 // Only replace the first occurrence
             );
+
             return $newContent !== null ? $newContent : $content;
         }
 
-        return substr_replace($content, $phpDoc . "\n    ", $offset, 0);
+        // No existing PHPDoc, simply insert the new one
+        return substr_replace($content, $phpDoc."\n    ", $offset, 0);
     }
 
     /**
@@ -396,7 +429,7 @@ class GenerateControllerDocsCommand extends Command
 
         if (preg_match('/namespace\s+([\w\\\\]+);/', $content, $nsMatch) &&
             preg_match('/class\s+(\w+)/', $content, $classMatch)) {
-            return $nsMatch[1] . '\\' . $classMatch[1];
+            return $nsMatch[1].'\\'.$classMatch[1];
         }
 
         return null;
