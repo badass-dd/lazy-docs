@@ -25,11 +25,13 @@ class ControllerDocBlockGenerator
         'complexity_score' => 0,
         'parameters' => [],
         'responses' => [],
+        'success_responses' => [],
         'exceptions' => [],
         'middleware' => [],
         'validations' => [],
         'model_fields' => [],
         'model_relations' => [],
+        'existing_phpdoc' => [],
     ];
 
     private string $methodContent = '';
@@ -38,22 +40,294 @@ class ControllerDocBlockGenerator
 
     private ?string $modelClass = null;
 
-    public function __construct(string $controllerClass, string $methodName)
+    private array $existingDocTags = [];
+
+    private bool $mergeMode = false;
+
+    public function __construct(string $controllerClass, string $methodName, bool $mergeMode = false)
     {
         $this->controllerClass = $controllerClass;
         $this->methodName = $methodName;
         $this->faker = FakerFactory::create();
+        $this->mergeMode = $mergeMode;
 
         $this->reflectionClass = new ReflectionClass($controllerClass);
         $this->reflectionMethod = $this->reflectionClass->getMethod($methodName);
 
         $this->extractMethodContent();
         $this->extractControllerContent();
+        $this->extractExistingPhpDoc();
         $this->analyzeMethod();
         $this->extractValidationRules();
         $this->extractMiddleware();
         $this->extractErrorResponses();
+        $this->extractSuccessResponses();
         $this->extractModelInfo();
+    }
+
+    /**
+     * Extract existing PHPDoc from method (for merge mode)
+     */
+    private function extractExistingPhpDoc(): void
+    {
+        $docComment = $this->reflectionMethod->getDocComment();
+        if (! $docComment) {
+            return;
+        }
+
+        // Parse existing @response tags
+        if (preg_match_all('/@response\s+(\d{3})\s+(\{[\s\S]*?\n\s*\*\s*\}|\[[\s\S]*?\n\s*\*\s*\])/m', $docComment, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $statusCode = (int) $match[1];
+                $body = $this->cleanDocCommentBlock($match[2]);
+                $this->existingDocTags['response'][$statusCode] = $body;
+            }
+        }
+
+        // Parse existing @bodyParam tags
+        if (preg_match_all('/@bodyParam\s+(\S+)\s+(\S+)\s+(required|optional)?\s*(.*?)(?=\n\s*\*\s*@|\n\s*\*\/)/s', $docComment, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $this->existingDocTags['bodyParam'][$match[1]] = [
+                    'type' => $match[2],
+                    'required' => $match[3] ?? 'optional',
+                    'description' => trim($match[4]),
+                ];
+            }
+        }
+
+        // Parse existing @queryParam tags
+        if (preg_match_all('/@queryParam\s+(\S+)\s+(\S+)\s+(required|optional)?\s*(.*?)(?=\n\s*\*\s*@|\n\s*\*\/)/s', $docComment, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $this->existingDocTags['queryParam'][$match[1]] = [
+                    'type' => $match[2],
+                    'required' => $match[3] ?? 'optional',
+                    'description' => trim($match[4]),
+                ];
+            }
+        }
+
+        // Parse existing @group tag
+        if (preg_match('/@group\s+(.+)$/m', $docComment, $match)) {
+            $this->existingDocTags['group'] = trim($match[1]);
+        }
+
+        // Parse existing title (first line after /**)
+        if (preg_match('/\/\*\*\s*\n\s*\*\s*([^@\n][^\n]*)/s', $docComment, $match)) {
+            $title = trim($match[1]);
+            if (! empty($title) && $title !== '*') {
+                $this->existingDocTags['title'] = $title;
+            }
+        }
+
+        // Parse description (lines after title before first @tag)
+        if (preg_match('/\/\*\*\s*\n\s*\*\s*[^@\n][^\n]*\n((?:\s*\*\s*[^@\n][^\n]*\n)*)/s', $docComment, $match)) {
+            $description = trim(preg_replace('/^\s*\*\s*/m', '', $match[1]));
+            if (! empty($description)) {
+                $this->existingDocTags['description'] = $description;
+            }
+        }
+
+        // Parse @authenticated tag
+        if (preg_match('/@authenticated/', $docComment)) {
+            $this->existingDocTags['authenticated'] = true;
+        }
+
+        $this->metadata['existing_phpdoc'] = $this->existingDocTags;
+    }
+
+    /**
+     * Clean PHPDoc comment block (remove * prefixes)
+     */
+    private function cleanDocCommentBlock(string $block): string
+    {
+        $lines = explode("\n", $block);
+        $cleaned = [];
+        foreach ($lines as $line) {
+            $cleaned[] = preg_replace('/^\s*\*\s?/', '', $line);
+        }
+
+        return trim(implode("\n", $cleaned));
+    }
+
+    /**
+     * Extract actual success responses from method code
+     */
+    private function extractSuccessResponses(): void
+    {
+        // Pattern 1: return response()->json(['key' => 'value']) - simple array without status code (defaults to 200)
+        // This captures the most common Laravel pattern
+        if (preg_match_all('/return\s+response\(\)\s*->\s*json\s*\(\s*(\[[^\]]*\])\s*\)\s*;/s', $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $arrayContent = $match[1];
+                $parsedResponse = $this->parsePhpArrayToJson($arrayContent);
+                if ($parsedResponse && ! isset($this->metadata['success_responses'][200])) {
+                    $this->metadata['success_responses'][200] = $parsedResponse;
+                }
+            }
+        }
+
+        // Pattern 2: return response()->json(['key' => 'value'], 200) - with explicit status code
+        if (preg_match_all('/return\s+response\(\)\s*->\s*json\s*\(\s*(\[[^\]]*\])\s*,\s*(\d{3})\s*\)\s*;/s', $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $arrayContent = $match[1];
+                $statusCode = (int) $match[2];
+
+                // Only capture success responses (2xx)
+                if ($statusCode >= 200 && $statusCode < 300) {
+                    $parsedResponse = $this->parsePhpArrayToJson($arrayContent);
+                    if ($parsedResponse) {
+                        $this->metadata['success_responses'][$statusCode] = $parsedResponse;
+                    }
+                }
+            }
+        }
+
+        // Pattern 3: return response()->json($variable) - variable response
+        if (preg_match_all('/return\s+response\(\)\s*->\s*json\s*\(\s*(\$\w+)\s*(?:,\s*(\d{3}))?\s*\)\s*;/s', $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $varName = $match[1];
+                $statusCode = isset($match[2]) ? (int) $match[2] : 200;
+
+                if ($statusCode >= 200 && $statusCode < 300) {
+                    $varContent = $this->traceVariableContent($varName);
+                    if ($varContent) {
+                        $this->metadata['success_responses'][$statusCode] = $varContent;
+                    }
+                }
+            }
+        }
+
+        // Pattern 4: return $model or return $collection (Eloquent returns)
+        if (preg_match('/return\s+(\$\w+)\s*;/', $this->methodContent, $match)) {
+            $varName = $match[1];
+            if (! isset($this->metadata['success_responses'][200])) {
+                $varContent = $this->traceVariableContent($varName);
+                if ($varContent) {
+                    $this->metadata['success_responses'][200] = $varContent;
+                }
+            }
+        }
+    }
+
+    /**
+     * Parse PHP array syntax to JSON-like structure
+     */
+    private function parsePhpArrayToJson(string $arrayContent): ?array
+    {
+        $result = [];
+
+        // Clean up the array content
+        $arrayContent = trim($arrayContent);
+        if (str_starts_with($arrayContent, '[')) {
+            $arrayContent = substr($arrayContent, 1);
+        }
+        if (str_ends_with($arrayContent, ']')) {
+            $arrayContent = substr($arrayContent, 0, -1);
+        }
+
+        // Match 'key' => value patterns (handles strings, null, true, false, numbers, variables)
+        if (preg_match_all("/['\"](\w+)['\"]\s*=>\s*(.+?)(?=,\s*['\"]|\s*\]|\s*$)/ms", $arrayContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $key = $match[1];
+                $value = trim($match[2], " \t\n\r\0\x0B,");
+
+                // Handle null
+                if ($value === 'null') {
+                    $result[$key] = null;
+                    continue;
+                }
+
+                // Handle true/false
+                if ($value === 'true') {
+                    $result[$key] = true;
+                    continue;
+                }
+                if ($value === 'false') {
+                    $result[$key] = false;
+                    continue;
+                }
+
+                // Handle numeric values
+                if (is_numeric($value)) {
+                    $result[$key] = $value + 0; // Convert to number
+                    continue;
+                }
+
+                // Handle string literals (single or double quoted)
+                if (preg_match('/^[\'"](.+)[\'"]$/s', $value, $strMatch)) {
+                    $strValue = $strMatch[1];
+                    // Clean up interpolated variables in strings like "Invoice non trovata: {$e->getMessage()}"
+                    $strValue = preg_replace('/\{\$\w+->getMessage\(\)\}/', '{error_message}', $strValue);
+                    $strValue = preg_replace('/\$\w+->getMessage\(\)/', '{error_message}', $strValue);
+                    $result[$key] = $strValue;
+                    continue;
+                }
+
+                // Handle exception message calls
+                if (preg_match('/\$\w+->getMessage\(\)/', $value)) {
+                    $result[$key] = '{error_message}';
+                    continue;
+                }
+
+                // Handle other variables
+                if (str_starts_with($value, '$')) {
+                    $result[$key] = $this->inferVariableType($value);
+                    continue;
+                }
+
+                // Default: use as-is
+                $result[$key] = $value;
+            }
+        }
+
+        return ! empty($result) ? $result : null;
+    }
+
+    /**
+     * Infer variable type from its name and context
+     */
+    private function inferVariableType(string $varName): mixed
+    {
+        $varName = ltrim($varName, '$');
+
+        // Common patterns
+        if (preg_match('/message|msg|text/i', $varName)) {
+            return 'Message text';
+        }
+        if (preg_match('/error|err/i', $varName)) {
+            return 'Error description';
+        }
+        if (preg_match('/id|Id|ID/', $varName)) {
+            return 1;
+        }
+        if (preg_match('/count|total|num/i', $varName)) {
+            return 0;
+        }
+        if (preg_match('/success|ok|result/i', $varName)) {
+            return true;
+        }
+
+        return 'value';
+    }
+
+    /**
+     * Try to trace what a variable contains
+     */
+    private function traceVariableContent(string $varName): ?array
+    {
+        $varName = preg_quote(ltrim($varName, '$'), '/');
+
+        // Check if variable is assigned from response()->json()
+        if (preg_match('/\$'.$varName.'\s*=\s*(\[[\s\S]*?\])\s*;/s', $this->methodContent, $match)) {
+            return $this->parsePhpArrayToJson($match[1]);
+        }
+
+        // Check if it's a collection/query result (return $pazienti, $performance, etc.)
+        if (preg_match('/\$'.$varName.'\s*=\s*.*?(?:->get\(|->select\(|DB::select)/s', $this->methodContent)) {
+            return ['_type' => 'query_result', '_variable' => $varName];
+        }
+
+        return null;
     }
 
     /**
@@ -345,14 +619,31 @@ class ControllerDocBlockGenerator
      */
     private function extractErrorResponses(): void
     {
-        // Find all response()->json() or response() with status codes
-        if (preg_match_all("/response\(\)\s*->\s*json\s*\(\s*\[?([^\]]*)\]?\s*,\s*(\d{3})\s*\)/s", $this->methodContent, $matches, PREG_SET_ORDER)) {
+        // Pattern 1: Find all response()->json([...], statusCode) with inline array
+        if (preg_match_all("/response\(\)\s*->\s*json\s*\(\s*\[([^\]]+)\]\s*,\s*(\d{3})\s*\)/s", $this->methodContent, $matches, PREG_SET_ORDER)) {
             foreach ($matches as $match) {
                 $statusCode = (int) $match[2];
-                $body = trim($match[1]);
+                $arrayContent = trim($match[1]);
 
                 if ($statusCode >= 400) {
-                    $this->metadata['responses'][$statusCode] = $body;
+                    // Parse the array content to extract key and message
+                    $errorResponse = $this->parseErrorArrayContent($arrayContent, $statusCode);
+                    $this->metadata['responses'][$statusCode] = $errorResponse;
+                }
+            }
+        }
+
+        // Pattern 2: Find response()->json($variable, statusCode) - variable response
+        if (preg_match_all('/return\s+response\(\)\s*->\s*json\s*\(\s*(\$\w+)\s*,\s*(\d{3})\s*\)\s*;/s', $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $varName = $match[1];
+                $statusCode = (int) $match[2];
+
+                if ($statusCode >= 400 && ! isset($this->metadata['responses'][$statusCode])) {
+                    $varContent = $this->traceVariableContent($varName);
+                    if ($varContent && is_array($varContent)) {
+                        $this->metadata['responses'][$statusCode] = $varContent;
+                    }
                 }
             }
         }
@@ -364,10 +655,54 @@ class ControllerDocBlockGenerator
                 $message = $match[2];
 
                 if ($statusCode >= 400) {
-                    $this->metadata['responses'][$statusCode] = $message;
+                    $this->metadata['responses'][$statusCode] = ['message' => $message];
                 }
             }
         }
+    }
+
+    /**
+     * Parse error array content to extract key-value pairs
+     */
+    private function parseErrorArrayContent(string $arrayContent, int $statusCode): array
+    {
+        $result = [];
+
+        // Pattern to match 'key' => 'value' or 'key' => 'value' . $var->method()
+        // We want to extract the key and the static part of the message
+        if (preg_match_all("/['\"](\w+)['\"]\s*=>\s*['\"]([^'\"]*)['\"](?:\s*\.\s*[^\,\]]+)?/", $arrayContent, $keyValueMatches, PREG_SET_ORDER)) {
+            foreach ($keyValueMatches as $kv) {
+                $key = $kv[1];
+                $value = $kv[2];
+
+                // For error messages that have dynamic parts (like $e->getMessage()),
+                // we use a generic placeholder description
+                if ($statusCode >= 500 && str_contains($arrayContent, '$e->getMessage()')) {
+                    $result[$key] = $value.'{exception_message}';
+                } elseif (str_contains($arrayContent, '$e->getMessage()') || str_contains($arrayContent, '->getMessage()')) {
+                    $result[$key] = $value.'{error_message}';
+                } else {
+                    $result[$key] = $value;
+                }
+            }
+        }
+
+        // If no key-value pairs found, return a generic structure
+        if (empty($result)) {
+            if ($statusCode >= 500) {
+                $result['error'] = 'Internal server error';
+            } elseif ($statusCode === 404) {
+                $result['message'] = 'Resource not found';
+            } elseif ($statusCode === 403) {
+                $result['message'] = 'Forbidden';
+            } elseif ($statusCode === 401) {
+                $result['message'] = 'Unauthenticated';
+            } else {
+                $result['error'] = 'An error occurred';
+            }
+        }
+
+        return $result;
     }
 
     /**
@@ -459,35 +794,63 @@ class ControllerDocBlockGenerator
             // Combine fillable and visible, exclude hidden
             $fields = ! empty($visible) ? $visible : $fillable;
 
-            // Add standard fields
-            $standardFields = ['id', 'created_at', 'updated_at'];
-            $fields = array_merge($standardFields, $fields);
-            $fields = array_unique($fields);
+            // If no fillable/visible, try to extract from PHPDoc @property annotations
+            if (empty($fields)) {
+                $fields = $this->extractFieldsFromPhpDoc($reflection);
+            }
+
+            // If still no fields, try to get from database schema
+            if (empty($fields)) {
+                $fields = $this->extractFieldsFromDatabase($instance);
+            }
+
+            // Check if fields is associative (from PHPDoc/DB) or sequential (from fillable)
+            $isAssociative = ! empty($fields) && ! array_is_list($fields);
+
+            if ($isAssociative) {
+                // Fields already have types, just ensure standard fields exist
+                if (! isset($fields['id'])) {
+                    $fields = ['id' => 'integer'] + $fields;
+                }
+                if (! isset($fields['created_at'])) {
+                    $fields['created_at'] = 'datetime';
+                }
+                if (! isset($fields['updated_at'])) {
+                    $fields['updated_at'] = 'datetime';
+                }
+            } else {
+                // Sequential array - add standard fields
+                $standardFields = ['id', 'created_at', 'updated_at'];
+                $fields = array_merge($standardFields, $fields);
+                $fields = array_unique($fields);
+            }
 
             // Remove hidden fields
-            $fields = array_diff($fields, $hidden);
+            if ($isAssociative) {
+                foreach ($hidden as $hiddenField) {
+                    unset($fields[$hiddenField]);
+                }
+            } else {
+                $fields = array_diff($fields, $hidden);
+            }
 
             // Build field metadata with types
-            foreach ($fields as $field) {
-                $type = 'string';
+            foreach ($fields as $field => $type) {
+                // If $fields is a sequential array (from fillable), convert to associative
+                if (is_int($field)) {
+                    $field = $type;
+                    $type = null;
+                }
 
-                // Infer type from casts
-                if (isset($casts[$field])) {
-                    $castType = $casts[$field];
-                    if (in_array($castType, ['int', 'integer'])) {
-                        $type = 'integer';
-                    } elseif (in_array($castType, ['bool', 'boolean'])) {
-                        $type = 'boolean';
-                    } elseif (in_array($castType, ['float', 'double', 'decimal'])) {
-                        $type = 'number';
-                    } elseif (in_array($castType, ['array', 'json', 'collection'])) {
-                        $type = 'array';
-                    } elseif (in_array($castType, ['date', 'datetime', 'timestamp'])) {
-                        $type = 'datetime';
+                // Determine type
+                if ($type === null || ! is_string($type)) {
+                    // Infer type from casts first
+                    if (isset($casts[$field])) {
+                        $type = $this->inferTypeFromCast($casts[$field]);
+                    } else {
+                        // Infer type from field name
+                        $type = $this->inferTypeFromFieldName($field);
                     }
-                } else {
-                    // Infer type from field name
-                    $type = $this->inferTypeFromFieldName($field);
                 }
 
                 $this->metadata['model_fields'][$field] = $type;
@@ -495,6 +858,129 @@ class ControllerDocBlockGenerator
         } catch (\Throwable $e) {
             // Silent fail - model might not be instantiable
         }
+    }
+
+    /**
+     * Extract fields from PHPDoc @property annotations
+     */
+    private function extractFieldsFromPhpDoc(ReflectionClass $reflection): array
+    {
+        $docComment = $reflection->getDocComment();
+        if (! $docComment) {
+            return [];
+        }
+
+        $fields = [];
+
+        // Match @property type $name patterns
+        if (preg_match_all('/@property\s+([^\s]+)\s+\$(\w+)/', $docComment, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $phpType = $match[1];
+                $fieldName = $match[2];
+
+                // Convert PHP types to our type system
+                $type = $this->convertPhpTypeToFieldType($phpType);
+                $fields[$fieldName] = $type;
+            }
+        }
+
+        return $fields;
+    }
+
+    /**
+     * Extract fields from database schema
+     */
+    private function extractFieldsFromDatabase($modelInstance): array
+    {
+        try {
+            $table = $modelInstance->getTable();
+            $connection = $modelInstance->getConnection();
+            $columns = $connection->getSchemaBuilder()->getColumnListing($table);
+
+            $fields = [];
+            foreach ($columns as $column) {
+                try {
+                    $columnType = $connection->getSchemaBuilder()->getColumnType($table, $column);
+                    $fields[$column] = $this->convertDbTypeToFieldType($columnType);
+                } catch (\Throwable $e) {
+                    $fields[$column] = 'string';
+                }
+            }
+
+            return $fields;
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * Convert PHP type annotation to field type
+     */
+    private function convertPhpTypeToFieldType(string $phpType): string
+    {
+        // Remove nullable indicator
+        $phpType = ltrim($phpType, '?');
+
+        // Handle union types (take first non-null)
+        if (str_contains($phpType, '|')) {
+            $types = explode('|', $phpType);
+            foreach ($types as $t) {
+                if (strtolower($t) !== 'null') {
+                    $phpType = $t;
+                    break;
+                }
+            }
+        }
+
+        $phpType = strtolower($phpType);
+
+        return match ($phpType) {
+            'int', 'integer' => 'integer',
+            'bool', 'boolean' => 'boolean',
+            'float', 'double' => 'number',
+            'array' => 'array',
+            '\illuminate\support\carbon', 'carbon', 'datetime', '\datetime' => 'datetime',
+            default => 'string',
+        };
+    }
+
+    /**
+     * Convert database column type to field type
+     */
+    private function convertDbTypeToFieldType(string $dbType): string
+    {
+        $dbType = strtolower($dbType);
+
+        return match (true) {
+            in_array($dbType, ['int', 'integer', 'bigint', 'smallint', 'tinyint', 'mediumint']) => 'integer',
+            in_array($dbType, ['bool', 'boolean']) => 'boolean',
+            in_array($dbType, ['float', 'double', 'decimal', 'real']) => 'number',
+            in_array($dbType, ['json', 'jsonb']) => 'array',
+            in_array($dbType, ['date', 'datetime', 'timestamp', 'time']) => 'datetime',
+            default => 'string',
+        };
+    }
+
+    /**
+     * Infer type from Laravel cast
+     */
+    private function inferTypeFromCast(string $castType): string
+    {
+        $castType = strtolower($castType);
+
+        // Handle cast classes and parameters like 'decimal:2'
+        if (str_contains($castType, ':')) {
+            $castType = explode(':', $castType)[0];
+        }
+
+        return match ($castType) {
+            'int', 'integer' => 'integer',
+            'bool', 'boolean' => 'boolean',
+            'float', 'double', 'decimal', 'real' => 'number',
+            'array', 'json', 'collection', 'object' => 'array',
+            'date', 'datetime', 'timestamp', 'immutable_date', 'immutable_datetime' => 'datetime',
+            default => 'string',
+        };
     }
 
     /**
@@ -1267,26 +1753,162 @@ class ControllerDocBlockGenerator
 
     /**
      * Generate response documentation with realistic examples
+     * Now analyzes actual return statements in the code
      */
     private function generateResponseDocs(): array
     {
         $lines = [];
-
-        // Success response based on method
-        $successStatus = $this->getSuccessHttpStatus();
-
-        // Add success response
-        $lines[] = " * @response {$successStatus} {";
-
         $resourceName = $this->getResourceName();
         $timestamp = $this->faker->dateTimeThisYear()->format('Y-m-d\TH:i:s.000000\Z');
+        $generatedStatusCodes = [];
 
-        // Determine which fields to use: validations or model fields
+        // In merge mode, first add existing responses that are well-formatted
+        if ($this->mergeMode && ! empty($this->existingDocTags['response'])) {
+            foreach ($this->existingDocTags['response'] as $statusCode => $body) {
+                // Reformat the body with proper PHPDoc formatting
+                $lines[] = " * @response {$statusCode} {";
+                $bodyLines = explode("\n", trim($body, "{}[]"));
+                foreach ($bodyLines as $bodyLine) {
+                    $bodyLine = trim($bodyLine);
+                    if (! empty($bodyLine)) {
+                        $lines[] = " *   {$bodyLine}";
+                    }
+                }
+                $lines[] = ' * }';
+                $lines[] = ' *';
+                $generatedStatusCodes[] = $statusCode;
+            }
+        }
+
+        // Add new responses (both in merge mode and normal mode)
+        // In merge mode, this adds responses not already present in existing doc
+        // Check if we have actual success responses extracted from code
+        if (! empty($this->metadata['success_responses'])) {
+            foreach ($this->metadata['success_responses'] as $statusCode => $responseData) {
+                if (in_array($statusCode, $generatedStatusCodes)) {
+                    continue;
+                }
+                if (is_array($responseData)) {
+                    // Check if it's a query result marker
+                    if (isset($responseData['_type']) && $responseData['_type'] === 'query_result') {
+                        // Generate response based on method analysis
+                        $lines = array_merge($lines, $this->generateQueryResultResponse($statusCode));
+                    } else {
+                        // Use the actual parsed response structure
+                        $lines[] = " * @response {$statusCode} {";
+                        foreach ($responseData as $key => $value) {
+                            $formattedValue = $this->formatResponseValue($value);
+                            $lines[] = " *   \"{$key}\": {$formattedValue}";
+                        }
+                        $lines[] = ' * }';
+                        $lines[] = ' *';
+                    }
+                    $generatedStatusCodes[] = $statusCode;
+                }
+            }
+        } elseif (! $this->mergeMode) {
+            // Fallback to method-based generation only when not in merge mode
+            $lines = array_merge($lines, $this->generateMethodBasedResponse($resourceName, $timestamp));
+        }
+
+        // Add error responses extracted from controller
+        if (! empty($this->metadata['responses'])) {
+            foreach ($this->metadata['responses'] as $statusCode => $body) {
+                if (in_array($statusCode, $generatedStatusCodes)) {
+                    continue;
+                }
+                $lines[] = " * @response {$statusCode} {";
+                if (is_array($body)) {
+                    // New format: array with key-value pairs
+                    $lastKey = array_key_last($body);
+                    foreach ($body as $key => $value) {
+                        $comma = $key !== $lastKey ? ',' : '';
+                        $lines[] = " *   \"{$key}\": \"{$value}\"{$comma}";
+                    }
+                } else {
+                    // Legacy format: string message
+                    $lines[] = ' *   "error": "'.$this->cleanResponseMessage($body).'"';
+                }
+                $lines[] = ' * }';
+                $lines[] = ' *';
+                $generatedStatusCodes[] = $statusCode;
+            }
+        }
+
+        // Add standard error responses based on method type (only if not already present)
+        $this->addMissingErrorResponses($lines, $resourceName, $generatedStatusCodes);
+
+        return $lines;
+    }
+
+    /**
+     * Format a response value for JSON output
+     */
+    private function formatResponseValue(mixed $value): string
+    {
+        if (is_bool($value)) {
+            return $value ? 'true' : 'false';
+        }
+        if (is_numeric($value)) {
+            return (string) $value;
+        }
+        if (is_array($value)) {
+            return json_encode($value);
+        }
+
+        return '"'.addslashes((string) $value).'"';
+    }
+
+    /**
+     * Generate response for query results (arrays/collections)
+     */
+    private function generateQueryResultResponse(int $statusCode): array
+    {
+        $lines = [];
+        $fieldsToUse = $this->getResponseFields();
+        $timestamp = $this->faker->dateTimeThisYear()->format('Y-m-d\TH:i:s.000000\Z');
+
+        $lines[] = " * @response {$statusCode} [";
+        $lines[] = ' *   {';
+
+        if (! empty($fieldsToUse)) {
+            $lines[] = ' *     "id": '.$this->faker->numberBetween(1, 100).',';
+            foreach ($fieldsToUse as $field => $type) {
+                if ($field === 'id' || $field === 'created_at' || $field === 'updated_at') {
+                    continue;
+                }
+                $example = $this->generateFakerExample($field, $type, '');
+                $value = $this->formatJsonValue($example, $type);
+                $lines[] = " *     \"{$field}\": {$value},";
+            }
+            $this->addRelationsToResponse($lines, '    ');
+            $lines[] = " *     \"created_at\": \"{$timestamp}\"";
+        } else {
+            // Generic structure
+            $lines[] = ' *     "id": 1,';
+            $lines[] = ' *     "name": "Example"';
+        }
+
+        $lines[] = ' *   }';
+        $lines[] = ' * ]';
+        $lines[] = ' *';
+
+        return $lines;
+    }
+
+    /**
+     * Generate method-based response (fallback for standard CRUD methods)
+     */
+    private function generateMethodBasedResponse(string $resourceName, string $timestamp): array
+    {
+        $lines = [];
+        $successStatus = $this->getSuccessHttpStatus();
         $fieldsToUse = $this->getResponseFields();
 
         switch ($this->methodName) {
             case 'index':
             case 'list':
+                $lines[] = " * @response {$successStatus} {";
                 $lines[] = ' *   "data": [{';
                 $lines[] = ' *     "id": '.$this->faker->numberBetween(1, 100).',';
                 foreach ($fieldsToUse as $field => $type) {
@@ -1297,13 +1919,16 @@ class ControllerDocBlockGenerator
                     $value = $this->formatJsonValue($example, $type);
                     $lines[] = " *     \"{$field}\": {$value},";
                 }
-                // Add loaded relations
                 $this->addRelationsToResponse($lines, '    ');
                 $lines[] = " *     \"created_at\": \"{$timestamp}\"";
                 $lines[] = ' *   }],';
                 $lines[] = ' *   "meta": {"current_page": 1, "per_page": 15, "total": '.$this->faker->numberBetween(10, 200).'}';
+                $lines[] = ' * }';
+                $lines[] = ' *';
                 break;
+
             case 'show':
+                $lines[] = " * @response {$successStatus} {";
                 $lines[] = ' *   "id": '.$this->faker->numberBetween(1, 100).',';
                 foreach ($fieldsToUse as $field => $type) {
                     if ($field === 'id' || $field === 'created_at' || $field === 'updated_at') {
@@ -1313,13 +1938,16 @@ class ControllerDocBlockGenerator
                     $value = $this->formatJsonValue($example, $type);
                     $lines[] = " *   \"{$field}\": {$value},";
                 }
-                // Add loaded relations
                 $this->addRelationsToResponse($lines, '  ');
                 $lines[] = " *   \"created_at\": \"{$timestamp}\",";
                 $lines[] = " *   \"updated_at\": \"{$timestamp}\"";
+                $lines[] = ' * }';
+                $lines[] = ' *';
                 break;
+
             case 'store':
             case 'create':
+                $lines[] = " * @response {$successStatus} {";
                 $lines[] = ' *   "id": '.$this->faker->numberBetween(1, 100).',';
                 foreach ($fieldsToUse as $field => $type) {
                     if ($field === 'id' || $field === 'created_at' || $field === 'updated_at') {
@@ -1330,9 +1958,13 @@ class ControllerDocBlockGenerator
                     $lines[] = " *   \"{$field}\": {$value},";
                 }
                 $lines[] = " *   \"created_at\": \"{$timestamp}\"";
+                $lines[] = ' * }';
+                $lines[] = ' *';
                 break;
+
             case 'update':
             case 'edit':
+                $lines[] = " * @response {$successStatus} {";
                 $lines[] = ' *   "id": '.$this->faker->numberBetween(1, 100).',';
                 foreach ($fieldsToUse as $field => $type) {
                     if ($field === 'id' || $field === 'created_at' || $field === 'updated_at') {
@@ -1343,32 +1975,97 @@ class ControllerDocBlockGenerator
                     $lines[] = " *   \"{$field}\": {$value},";
                 }
                 $lines[] = " *   \"updated_at\": \"{$timestamp}\"";
+                $lines[] = ' * }';
+                $lines[] = ' *';
                 break;
+
             case 'destroy':
             case 'delete':
+                $lines[] = " * @response {$successStatus} {";
                 $lines[] = " *   \"message\": \"{$resourceName} deleted successfully\"";
+                $lines[] = ' * }';
+                $lines[] = ' *';
                 break;
+
             default:
-                $lines[] = ' *   "success": true,';
-                $lines[] = ' *   "message": "Operation completed successfully"';
+                // For custom methods, try to infer from actual code
+                $lines = array_merge($lines, $this->generateCustomMethodResponse($successStatus));
+                break;
+        }
+
+        return $lines;
+    }
+
+    /**
+     * Generate response for custom (non-CRUD) methods by analyzing code
+     */
+    private function generateCustomMethodResponse(int $successStatus): array
+    {
+        $lines = [];
+
+        // Try to extract actual response structure from return statements
+        if (preg_match('/return\s+response\(\)\s*->\s*json\s*\(\s*\[([^\]]*)\]/s', $this->methodContent, $match)) {
+            $arrayContent = '['.$match[1].']';
+            $parsed = $this->parsePhpArrayToJson($arrayContent);
+
+            if ($parsed && ! empty($parsed)) {
+                $lines[] = " * @response {$successStatus} {";
+                $isFirst = true;
+                $keys = array_keys($parsed);
+                $lastKey = end($keys);
+
+                foreach ($parsed as $key => $value) {
+                    $formattedValue = $this->formatResponseValue($value);
+                    $comma = ($key !== $lastKey) ? ',' : '';
+                    $lines[] = " *   \"{$key}\": {$formattedValue}{$comma}";
+                }
+                $lines[] = ' * }';
+                $lines[] = ' *';
+
+                return $lines;
+            }
+        }
+
+        // Check if method returns a variable that's a collection/array
+        if (preg_match('/return\s+response\(\)\s*->\s*json\s*\(\s*\$(\w+)/s', $this->methodContent, $match)) {
+            $varName = $match[1];
+
+            // Check if it's empty check before returning
+            if (preg_match('/if\s*\(\s*empty\s*\(\s*\$'.$varName.'\s*\)\s*\)/', $this->methodContent)) {
+                // This is likely returning an array/collection
+                $lines = array_merge($lines, $this->generateQueryResultResponse($successStatus));
+
+                return $lines;
+            }
+        }
+
+        // Default fallback - try to generate something meaningful
+        $lines[] = " * @response {$successStatus} {";
+
+        // Check for common patterns in method content
+        if (preg_match('/\[\s*[\'"]message[\'"]\s*=>\s*[\'"]([^"\']+)[\'"]/s', $this->methodContent, $msgMatch)) {
+            $lines[] = ' *   "message": "'.$msgMatch[1].'"';
+        } elseif (preg_match('/\[\s*[\'"]error[\'"]\s*=>\s*[\'"]([^"\']+)[\'"]/s', $this->methodContent, $errMatch)) {
+            $lines[] = ' *   "message": "Operation completed successfully"';
+        } else {
+            // Generic success response
+            $lines[] = ' *   "message": "Operation completed successfully"';
         }
 
         $lines[] = ' * }';
         $lines[] = ' *';
 
-        // Error responses - extract from controller
-        if (! empty($this->metadata['responses'])) {
-            foreach ($this->metadata['responses'] as $statusCode => $body) {
-                $lines[] = " * @response {$statusCode} {";
-                $lines[] = ' *   "message": "'.$this->cleanResponseMessage($body).'"';
-                $lines[] = ' * }';
-                $lines[] = ' *';
-            }
-        }
+        return $lines;
+    }
 
-        // Standard error responses
+    /**
+     * Add missing standard error responses based on method type
+     */
+    private function addMissingErrorResponses(array &$lines, string $resourceName, array $existingStatusCodes = []): void
+    {
+        // 404 for methods that work with specific resources
         if (in_array($this->methodName, ['show', 'update', 'destroy', 'edit', 'delete'])) {
-            if (empty($this->metadata['responses'][404])) {
+            if (empty($this->metadata['responses'][404]) && ! in_array(404, $existingStatusCodes)) {
                 $lines[] = ' * @response 404 {';
                 $lines[] = " *   \"message\": \"{$resourceName} not found\"";
                 $lines[] = ' * }';
@@ -1376,12 +2073,12 @@ class ControllerDocBlockGenerator
             }
         }
 
+        // 422 for methods that accept input
         if (in_array($this->methodName, ['store', 'update', 'create', 'edit'])) {
-            if (empty($this->metadata['responses'][422])) {
+            if (empty($this->metadata['responses'][422]) && ! in_array(422, $existingStatusCodes)) {
                 $lines[] = ' * @response 422 {';
                 $lines[] = ' *   "message": "The given data was invalid.",';
                 $lines[] = ' *   "errors": {';
-                // Use first validation field as example
                 $firstField = array_key_first($this->metadata['validations']) ?? 'field_name';
                 $lines[] = " *     \"{$firstField}\": [\"The {$firstField} field is required.\"]";
                 $lines[] = ' *   }';
@@ -1390,8 +2087,9 @@ class ControllerDocBlockGenerator
             }
         }
 
+        // 403 for methods with authorization
         if (preg_match('/authorize|gate|ability/i', $this->methodContent)) {
-            if (empty($this->metadata['responses'][403])) {
+            if (empty($this->metadata['responses'][403]) && ! in_array(403, $existingStatusCodes)) {
                 $lines[] = ' * @response 403 {';
                 $lines[] = ' *   "message": "This action is unauthorized."';
                 $lines[] = ' * }';
@@ -1399,7 +2097,15 @@ class ControllerDocBlockGenerator
             }
         }
 
-        return $lines;
+        // 500 - check if method has try-catch
+        if (preg_match('/catch\s*\(\s*\\\\?Throwable|\s*catch\s*\(\s*\\\\?Exception/i', $this->methodContent)) {
+            if (empty($this->metadata['responses'][500]) && ! in_array(500, $existingStatusCodes)) {
+                $lines[] = ' * @response 500 {';
+                $lines[] = ' *   "error": "Internal server error"';
+                $lines[] = ' * }';
+                $lines[] = ' *';
+            }
+        }
     }
 
     /**

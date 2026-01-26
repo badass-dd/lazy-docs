@@ -15,10 +15,11 @@ class GenerateControllerDocsCommand extends Command
                             {--method= : Specific method name to generate}
                             {--all : Generate for all controllers}
                             {--overwrite : Process methods that already have PHPDoc (replaces existing)}
+                            {--merge : Merge with existing PHPDoc, preserving user-written content}
                             {--dry-run : Preview changes without writing}
                             {--force : Include simple methods}';
 
-    protected $description = 'Generate intelligent PHPDoc for Laravel API controllers. Use PHP comments /* */ above PHPDoc blocks for developer notes that persist across regenerations.';
+    protected $description = 'Generate intelligent PHPDoc for Laravel API controllers. Use --merge to preserve user-written documentation while adding missing tags.';
 
     public function handle(): int
     {
@@ -178,17 +179,18 @@ class GenerateControllerDocsCommand extends Command
 
         $content = File::get($filePath);
 
-        // Check if method already has PHPDoc and --overwrite not specified
-        if (! $this->shouldGenerateDoc($content, $method) && ! $this->option('overwrite')) {
-            $this->warn("   ⊘ Method already has PHPDoc. Use --overwrite to replace.");
+        // Check if method already has PHPDoc and neither --overwrite nor --merge is specified
+        if (! $this->shouldGenerateDoc($content, $method) && ! $this->option('overwrite') && ! $this->option('merge')) {
+            $this->warn('   ⊘ Method already has PHPDoc. Use --overwrite to replace or --merge to add missing tags.');
 
             return 0;
         }
 
         $modified = false;
+        $mergeMode = (bool) $this->option('merge');
 
         try {
-            $generator = new ControllerDocBlockGenerator($className, $methodName);
+            $generator = new ControllerDocBlockGenerator($className, $methodName, $mergeMode);
             $phpDoc = $generator->generate();
             $complexity = $generator->metadata['complexity_score'];
 
@@ -264,14 +266,15 @@ class GenerateControllerDocsCommand extends Command
                 continue;
             }
 
-            if (! $this->shouldGenerateDoc($content, $method) && ! $this->option('overwrite')) {
+            if (! $this->shouldGenerateDoc($content, $method) && ! $this->option('overwrite') && ! $this->option('merge')) {
                 $this->line("   ⊘ <fg=gray>{$method->getName()}</> (already documented)");
                 $skipped++;
 
                 continue;
             }
 
-            $generator = new ControllerDocBlockGenerator($className, $method->getName());
+            $mergeMode = (bool) $this->option('merge');
+            $generator = new ControllerDocBlockGenerator($className, $method->getName(), $mergeMode);
             $complexity = $generator->metadata['complexity_score'];
 
             if ($complexity < 5 && ! $this->option('force')) {
@@ -380,7 +383,9 @@ class GenerateControllerDocsCommand extends Command
      */
     private function shouldGenerateDoc(string $content, ReflectionMethod $method): bool
     {
-        $pattern = '/\/\*\*.*?\*\/\s+(?:public|protected|private).*?'.preg_quote($method->getName()).'\s*\(/s';
+        // Pattern to check if there's a PHPDoc immediately before the method declaration
+        // The PHPDoc must be followed only by whitespace before the method, not by other code/methods
+        $pattern = '/\/\*\*(?:(?!\*\/).)*\*\/\s*(?:public|protected|private)(?:\s+(?:static|abstract))?\s+function\s+'.preg_quote($method->getName(), '/').'\s*\(/s';
 
         return ! preg_match($pattern, $content);
     }
@@ -394,30 +399,328 @@ class GenerateControllerDocsCommand extends Command
      */
     private function injectPhpDoc(string $content, string $methodName, string $phpDoc): string
     {
-        $pattern = '/(?=(?:public|protected|private)(?:\s+(?:static|abstract))?\s+(?:function\s+)?'.preg_quote($methodName).'\s*\()/';
+        // Pattern to find the method declaration
+        $methodPattern = '/(?:public|protected|private)(?:\s+(?:static|abstract))?\s+function\s+'.preg_quote($methodName, '/').'\s*\(/';
 
-        if (! preg_match($pattern, $content, $matches, PREG_OFFSET_CAPTURE)) {
+        if (! preg_match($methodPattern, $content, $matches, PREG_OFFSET_CAPTURE)) {
             return $content;
         }
 
-        $offset = $matches[0][1];
-        $beforeMethod = substr($content, max(0, $offset - 2000), min($offset, 2000));
+        $methodOffset = $matches[0][1];
 
-        // Check if there's an existing PHPDoc block before the method
-        if (preg_match('/\/\*\*.*?\*\/\s*$/is', $beforeMethod, $docMatch)) {
-            // Replace existing PHPDoc
-            $newContent = preg_replace(
-                '/\/\*\*.*?\*\/\s*(?=(?:public|protected|private)(?:\s+(?:static|abstract))?\s+(?:function\s+)?'.preg_quote($methodName).'\s*\()/is',
-                $phpDoc."\n    ",
-                $content,
-                1 // Only replace the first occurrence
-            );
+        // Look backwards from the method to find the immediate PHPDoc block (if any)
+        // Get the content before the method (max 2000 chars should be enough)
+        $searchStart = max(0, $methodOffset - 2000);
+        $beforeMethod = substr($content, $searchStart, $methodOffset - $searchStart);
 
-            return $newContent !== null ? $newContent : $content;
+        // Find the last PHPDoc block that immediately precedes the method
+        // Use strrpos to find the LAST occurrence of /**
+        $lastDocStart = strrpos($beforeMethod, '/**');
+        
+        if ($lastDocStart !== false) {
+            // Find the closing */ after this /**
+            $docContent = substr($beforeMethod, $lastDocStart);
+            if (preg_match('/^\/\*\*[\s\S]*?\*\//', $docContent, $docMatch)) {
+                $existingDocBlock = $docMatch[0];
+                $docEndInBeforeMethod = $lastDocStart + strlen($existingDocBlock);
+                
+                // Check if there's only whitespace between the doc block and the method
+                $gapContent = substr($beforeMethod, $docEndInBeforeMethod);
+                
+                if (preg_match('/^\s*$/', $gapContent)) {
+                    // This is the method's PHPDoc - calculate absolute positions
+                    $absoluteDocStart = $searchStart + $lastDocStart;
+
+                    // Determine the indentation from the existing doc block
+                    // Use [ \t]* instead of \s* to avoid capturing newlines
+                    $indentation = '';
+                    if (preg_match('/\n([ \t]*)\/\*\*/', substr($content, max(0, $absoluteDocStart - 50), 50 + 3), $indentMatch)) {
+                        $indentation = $indentMatch[1];
+                    } else {
+                        $indentation = '    '; // Default indentation
+                    }
+
+                    if ($this->option('merge')) {
+                        // Merge mode: preserve user content, add missing generated content
+                        $mergedDoc = $this->mergePhpDocs($existingDocBlock, $phpDoc);
+                        // Add proper indentation to each line
+                        $mergedDoc = $this->indentPhpDoc($mergedDoc, $indentation);
+
+                        // Replace: [before doc] + [merged doc] + [newline + indent] + [from method onwards]
+                        $newContent = substr($content, 0, $absoluteDocStart)
+                            .$mergedDoc."\n".$indentation
+                            .substr($content, $methodOffset);
+
+                        return $newContent;
+                    }
+
+                    // Overwrite mode: Replace existing PHPDoc
+                    $indentedPhpDoc = $this->indentPhpDoc($phpDoc, $indentation);
+                    $newContent = substr($content, 0, $absoluteDocStart)
+                        .$indentedPhpDoc."\n".$indentation
+                        .substr($content, $methodOffset);
+
+                    return $newContent;
+                }
+            }
         }
 
-        // No existing PHPDoc, simply insert the new one
-        return substr_replace($content, $phpDoc."\n    ", $offset, 0);
+        // No existing PHPDoc immediately before the method, insert new one
+        // Determine indentation from the method line
+        $indentation = '    '; // Default
+        $lineStart = strrpos(substr($content, 0, $methodOffset), "\n");
+        if ($lineStart !== false) {
+            $methodLine = substr($content, $lineStart + 1, $methodOffset - $lineStart - 1);
+            if (preg_match('/^([ \t]*)/', $methodLine, $indentMatch)) {
+                $indentation = $indentMatch[1];
+            }
+        }
+        
+        $indentedPhpDoc = $this->indentPhpDoc($phpDoc, $indentation);
+        return substr($content, 0, $methodOffset).$indentedPhpDoc."\n".$indentation.substr($content, $methodOffset);
+    }
+
+    /**
+     * Add indentation to each line of a PHPDoc block (except the first line)
+     */
+    private function indentPhpDoc(string $phpDoc, string $indentation): string
+    {
+        $lines = explode("\n", $phpDoc);
+        $indentedLines = [];
+        foreach ($lines as $index => $line) {
+            // First line already has indentation from the position in the file
+            if ($index === 0) {
+                $indentedLines[] = $line;
+            } else {
+                $indentedLines[] = $indentation.$line;
+            }
+        }
+
+        return implode("\n", $indentedLines);
+    }
+
+    /**
+     * Merge existing PHPDoc with generated PHPDoc
+     * Preserves user-written content, adds missing tags from generated doc
+     */
+    private function mergePhpDocs(string $existingDoc, string $generatedDoc): string
+    {
+        // Parse existing tags
+        $existingTags = $this->parsePhpDocTags($existingDoc);
+        $generatedTags = $this->parsePhpDocTags($generatedDoc);
+
+        // Start building merged doc
+        $lines = ['/**'];
+
+        // Preserve existing title and description
+        if (! empty($existingTags['title'])) {
+            $lines[] = ' * '.$existingTags['title'];
+        } elseif (! empty($generatedTags['title'])) {
+            $lines[] = ' * '.$generatedTags['title'];
+        }
+
+        $lines[] = ' *';
+
+        if (! empty($existingTags['description'])) {
+            foreach (explode("\n", $existingTags['description']) as $line) {
+                $lines[] = ' * '.$line;
+            }
+            $lines[] = ' *';
+        } elseif (! empty($generatedTags['description'])) {
+            foreach (explode("\n", $generatedTags['description']) as $line) {
+                $lines[] = ' * '.$line;
+            }
+            $lines[] = ' *';
+        }
+
+        // Preserve existing @group or use generated
+        $group = $existingTags['group'] ?? $generatedTags['group'] ?? null;
+        if ($group) {
+            $lines[] = ' * @group '.$group;
+            $lines[] = ' *';
+        }
+
+        // Handle @authenticated
+        if (! empty($existingTags['authenticated']) || ! empty($generatedTags['authenticated'])) {
+            $lines[] = ' * @authenticated';
+            $lines[] = ' *';
+        }
+
+        // Handle @api tag (use generated if exists, otherwise existing)
+        $api = $existingTags['api'] ?? $generatedTags['api'] ?? null;
+        if ($api) {
+            $lines[] = ' * @api '.$api;
+            $lines[] = ' *';
+        }
+
+        // Merge body/query params - prefer existing, add missing from generated
+        $params = $this->mergeParams(
+            $existingTags['bodyParam'] ?? [],
+            $generatedTags['bodyParam'] ?? []
+        );
+        foreach ($params as $param) {
+            $lines[] = ' * @bodyParam '.$param;
+        }
+
+        $queryParams = $this->mergeParams(
+            $existingTags['queryParam'] ?? [],
+            $generatedTags['queryParam'] ?? []
+        );
+        foreach ($queryParams as $param) {
+            $lines[] = ' * @queryParam '.$param;
+        }
+
+        if (! empty($params) || ! empty($queryParams)) {
+            $lines[] = ' *';
+        }
+
+        // Merge responses - prefer existing, add missing status codes from generated
+        $responses = $this->mergeResponses(
+            $existingTags['response'] ?? [],
+            $generatedTags['response'] ?? []
+        );
+        foreach ($responses as $statusCode => $body) {
+            $lines[] = " * @response {$statusCode} {";
+            // Add each line of the body with proper formatting
+            $bodyLines = explode("\n", trim($body, "{}"));
+            foreach ($bodyLines as $bodyLine) {
+                $bodyLine = trim($bodyLine);
+                if (! empty($bodyLine)) {
+                    $lines[] = " *   {$bodyLine}";
+                }
+            }
+            $lines[] = ' * }';
+            $lines[] = ' *';
+        }
+
+        $lines[] = ' */';
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * Parse PHPDoc tags from a doc block
+     */
+    private function parsePhpDocTags(string $docBlock): array
+    {
+        $tags = [];
+
+        // Extract title (first non-tag line after /**)
+        if (preg_match('/\/\*\*\s*\n\s*\*\s*([^@\n][^\n]*)/s', $docBlock, $match)) {
+            $title = trim($match[1]);
+            if (! empty($title) && $title !== '*') {
+                $tags['title'] = $title;
+            }
+        }
+
+        // Extract description - everything between title and first @tag
+        // Find content between title line and first @tag line
+        if (preg_match('/\/\*\*\s*\n\s*\*\s*[^@\n][^\n]*\n([\s\S]*?)(?=\s*\*\s*@|\s*\*\/)/s', $docBlock, $match)) {
+            // Clean: remove * prefixes and filter out empty lines at start/end
+            $descLines = [];
+            foreach (explode("\n", $match[1]) as $line) {
+                $cleanLine = preg_replace('/^\s*\*\s?/', '', $line);
+                // Stop if we hit a line starting with @ (shouldn't happen with lookahead, but safety)
+                if (preg_match('/^\s*@/', $cleanLine)) {
+                    break;
+                }
+                $descLines[] = $cleanLine;
+            }
+            $description = trim(implode("\n", $descLines));
+            if (! empty($description)) {
+                $tags['description'] = $description;
+            }
+        }
+
+        // Extract @group
+        if (preg_match('/@group\s+(.+)$/m', $docBlock, $match)) {
+            $tags['group'] = trim($match[1]);
+        }
+
+        // Extract @authenticated
+        if (preg_match('/@authenticated/', $docBlock)) {
+            $tags['authenticated'] = true;
+        }
+
+        // Extract @api
+        if (preg_match('/@api\s+(.+)$/m', $docBlock, $match)) {
+            $tags['api'] = trim($match[1]);
+        }
+
+        // Extract @bodyParam
+        if (preg_match_all('/@bodyParam\s+(.+)$/m', $docBlock, $matches)) {
+            $tags['bodyParam'] = $matches[1];
+        }
+
+        // Extract @queryParam
+        if (preg_match_all('/@queryParam\s+(.+)$/m', $docBlock, $matches)) {
+            $tags['queryParam'] = $matches[1];
+        }
+
+        // Extract @response with their full content (including multi-line JSON)
+        // Pattern matches @response STATUS_CODE followed by { or [ and captures until closing } or ]
+        if (preg_match_all('/@response\s+(\d{3})\s*(\{[\s\S]*?\n\s*\*\s*\}|\[[\s\S]*?\n\s*\*\s*\])/m', $docBlock, $matches, PREG_SET_ORDER)) {
+            $tags['response'] = [];
+            foreach ($matches as $match) {
+                $statusCode = $match[1];
+                $body = $match[2];
+                // Clean the body - remove * prefixes from each line
+                $cleanBody = preg_replace('/^\s*\*\s?/m', '', $body);
+                $tags['response'][$statusCode] = trim($cleanBody);
+            }
+        }
+
+        return $tags;
+    }
+
+    /**
+     * Merge parameter lists - keep existing, add missing from generated
+     */
+    private function mergeParams(array $existing, array $generated): array
+    {
+        $existingFields = [];
+        foreach ($existing as $param) {
+            if (preg_match('/^(\S+)/', $param, $match)) {
+                $existingFields[$match[1]] = $param;
+            }
+        }
+
+        foreach ($generated as $param) {
+            if (preg_match('/^(\S+)/', $param, $match)) {
+                $field = $match[1];
+                if (! isset($existingFields[$field])) {
+                    $existingFields[$field] = $param;
+                }
+            }
+        }
+
+        return array_values($existingFields);
+    }
+
+    /**
+     * Merge response lists - keep existing status codes, add missing from generated
+     * Now works with associative arrays keyed by status code
+     */
+    private function mergeResponses(array $existing, array $generated): array
+    {
+        $merged = [];
+
+        // Add all existing responses
+        foreach ($existing as $statusCode => $body) {
+            $merged[$statusCode] = $body;
+        }
+
+        // Add generated responses only if status code doesn't exist
+        foreach ($generated as $statusCode => $body) {
+            if (! isset($merged[$statusCode])) {
+                $merged[$statusCode] = $body;
+            }
+        }
+
+        // Sort by status code
+        ksort($merged);
+
+        return $merged;
     }
 
     /**
