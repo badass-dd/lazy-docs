@@ -408,17 +408,21 @@ class GenerateControllerDocsCommand extends Command
 
         $methodOffset = $matches[0][1];
 
-        // Look backwards from the method to find the immediate PHPDoc block (if any)
-        // Get the content before the method (max 2000 chars should be enough)
-        $searchStart = max(0, $methodOffset - 2000);
+        // Look backwards from the method to find ALL consecutive PHPDoc blocks
+        // Get the content before the method (max 5000 chars to handle multiple blocks)
+        $searchStart = max(0, $methodOffset - 5000);
         $beforeMethod = substr($content, $searchStart, $methodOffset - $searchStart);
 
-        // Find the last PHPDoc block that immediately precedes the method
-        // Use strrpos to find the LAST occurrence of /**
+        // Find all consecutive PHPDoc blocks immediately before the method
+        // Work backwards to find the first PHPDoc block in a consecutive sequence
+        $firstDocStart = null;
+        $lastDocEnd = null;
+        $indentation = '    ';
+        
+        // Find the last PHPDoc block first
         $lastDocStart = strrpos($beforeMethod, '/**');
         
         if ($lastDocStart !== false) {
-            // Find the closing */ after this /**
             $docContent = substr($beforeMethod, $lastDocStart);
             if (preg_match('/^\/\*\*[\s\S]*?\*\//', $docContent, $docMatch)) {
                 $existingDocBlock = $docMatch[0];
@@ -428,25 +432,54 @@ class GenerateControllerDocsCommand extends Command
                 $gapContent = substr($beforeMethod, $docEndInBeforeMethod);
                 
                 if (preg_match('/^\s*$/', $gapContent)) {
-                    // This is the method's PHPDoc - calculate absolute positions
-                    $absoluteDocStart = $searchStart + $lastDocStart;
+                    // This is the method's PHPDoc - now find ALL consecutive blocks
+                    $lastDocEnd = $docEndInBeforeMethod;
+                    $firstDocStart = $lastDocStart;
+                    
+                    // Keep looking backwards for more consecutive PHPDoc blocks
+                    $searchPos = $lastDocStart;
+                    while ($searchPos > 0) {
+                        // Look for another PHPDoc block before this one
+                        $prevContent = substr($beforeMethod, 0, $searchPos);
+                        $prevDocStart = strrpos($prevContent, '/**');
+                        
+                        if ($prevDocStart === false) {
+                            break;
+                        }
+                        
+                        // Check if this previous block ends right before the current one (only whitespace between)
+                        $prevDocContent = substr($prevContent, $prevDocStart);
+                        if (preg_match('/^\/\*\*[\s\S]*?\*\//', $prevDocContent, $prevDocMatch)) {
+                            $prevDocEnd = $prevDocStart + strlen($prevDocMatch[0]);
+                            $gapBetween = substr($beforeMethod, $prevDocEnd, $searchPos - $prevDocEnd);
+                            
+                            // If only whitespace between blocks, they are consecutive
+                            if (preg_match('/^\s*$/', $gapBetween)) {
+                                $firstDocStart = $prevDocStart;
+                                $searchPos = $prevDocStart;
+                            } else {
+                                // Not consecutive, stop
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    // Calculate absolute position of the first doc block
+                    $absoluteDocStart = $searchStart + $firstDocStart;
 
-                    // Determine the indentation from the existing doc block
-                    // Use [ \t]* instead of \s* to avoid capturing newlines
-                    $indentation = '';
+                    // Determine the indentation from the first doc block
                     if (preg_match('/\n([ \t]*)\/\*\*/', substr($content, max(0, $absoluteDocStart - 50), 50 + 3), $indentMatch)) {
                         $indentation = $indentMatch[1];
-                    } else {
-                        $indentation = '    '; // Default indentation
                     }
 
                     if ($this->option('merge')) {
-                        // Merge mode: preserve user content, add missing generated content
+                        // Merge mode: use only the LAST doc block for merging (most recent)
                         $mergedDoc = $this->mergePhpDocs($existingDocBlock, $phpDoc);
-                        // Add proper indentation to each line
                         $mergedDoc = $this->indentPhpDoc($mergedDoc, $indentation);
 
-                        // Replace: [before doc] + [merged doc] + [newline + indent] + [from method onwards]
+                        // Replace ALL consecutive blocks with the merged one
                         $newContent = substr($content, 0, $absoluteDocStart)
                             .$mergedDoc."\n".$indentation
                             .substr($content, $methodOffset);
@@ -454,7 +487,7 @@ class GenerateControllerDocsCommand extends Command
                         return $newContent;
                     }
 
-                    // Overwrite mode: Replace existing PHPDoc
+                    // Overwrite mode: Replace ALL existing consecutive PHPDoc blocks
                     $indentedPhpDoc = $this->indentPhpDoc($phpDoc, $indentation);
                     $newContent = substr($content, 0, $absoluteDocStart)
                         .$indentedPhpDoc."\n".$indentation
@@ -467,7 +500,6 @@ class GenerateControllerDocsCommand extends Command
 
         // No existing PHPDoc immediately before the method, insert new one
         // Determine indentation from the method line
-        $indentation = '    '; // Default
         $lineStart = strrpos(substr($content, 0, $methodOffset), "\n");
         if ($lineStart !== false) {
             $methodLine = substr($content, $lineStart + 1, $methodOffset - $lineStart - 1);
