@@ -59,10 +59,13 @@ class ControllerDocBlockGenerator
         $this->extractExistingPhpDoc();
         $this->analyzeMethod();
         $this->extractValidationRules();
+        $this->extractQueryParameters();
         $this->extractMiddleware();
         $this->extractErrorResponses();
         $this->extractSuccessResponses();
         $this->extractModelInfo();
+        $this->extractFileUploads();
+        $this->extractAuthorization();
     }
 
     /**
@@ -154,9 +157,20 @@ class ControllerDocBlockGenerator
      */
     private function extractSuccessResponses(): void
     {
+        // Pattern 0: return response()->download() - file download response
+        // This should be detected first to generate proper binary response documentation
+        if (preg_match('/return\s+response\(\)\s*->\s*download\s*\(/s', $this->methodContent)) {
+            if (! isset($this->metadata['success_responses'][200])) {
+                $this->metadata['success_responses'][200] = [
+                    '_type' => 'binary_download',
+                ];
+            }
+        }
+
         // Pattern 1: return response()->json(['key' => 'value']) - simple array without status code (defaults to 200)
         // This captures the most common Laravel pattern
-        if (preg_match_all('/return\s+response\(\)\s*->\s*json\s*\(\s*(\[[^\]]*\])\s*\)\s*;/s', $this->methodContent, $matches, PREG_SET_ORDER)) {
+        // Use negative lookahead to exclude cases with explicit status code
+        if (preg_match_all('/return\s+response\(\)\s*->\s*json\s*\(\s*(\[[^\]]*\])\s*\)(?!\s*,\s*\d{3})\s*;/s', $this->methodContent, $matches, PREG_SET_ORDER)) {
             foreach ($matches as $match) {
                 $arrayContent = $match[1];
                 $parsedResponse = $this->parsePhpArrayToJson($arrayContent);
@@ -197,6 +211,40 @@ class ControllerDocBlockGenerator
             }
         }
 
+        // Pattern 3b: return response()->json($model->load('rel1', 'rel2.nested'), statusCode?) - model with eager loaded relations
+        // Status code is optional - defaults to 200
+        if (preg_match_all('/return\s+response\(\)\s*->\s*json\s*\(\s*\$(\w+)->load\s*\(\s*([^)]+)\s*\)(?:\s*,\s*(\d{3}))?\s*\)\s*;/s', $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $modelVarName = $match[1];
+                $loadContent = $match[2];
+                $statusCode = isset($match[3]) ? (int) $match[3] : 200;
+
+                if ($statusCode >= 200 && $statusCode < 300 && ! isset($this->metadata['success_responses'][$statusCode])) {
+                    // Try to get the model type from the variable
+                    $varContent = $this->traceVariableContent('$'.$modelVarName);
+                    $modelClass = $varContent['_model'] ?? null;
+
+                    // If we can't trace the variable, try to infer from variable name
+                    if (! $modelClass) {
+                        $modelClass = ucfirst($modelVarName);
+                    }
+
+                    $modelFields = $this->extractModelFields($modelClass);
+                    if (! empty($modelFields)) {
+                        // Parse the eager relations from load()
+                        $eagerRelations = $this->parseEagerLoadRelations($loadContent, $modelClass);
+
+                        $this->metadata['success_responses'][$statusCode] = [
+                            '_type' => 'model',
+                            '_model' => $modelClass,
+                            '_fields' => $modelFields,
+                            '_eager_relations' => $eagerRelations,
+                        ];
+                    }
+                }
+            }
+        }
+
         // Pattern 4: return $model or return $collection (Eloquent returns)
         if (preg_match('/return\s+(\$\w+)\s*;/', $this->methodContent, $match)) {
             $varName = $match[1];
@@ -208,7 +256,58 @@ class ControllerDocBlockGenerator
             }
         }
 
-        // Pattern 5: return Model::collectionMethods() - direct Eloquent collection return
+        // Pattern 4b: return $model->load('rel1', 'rel2.nested') - direct model return with eager loading
+        if (preg_match('/return\s+\$(\w+)->load\s*\(\s*([^)]+)\s*\)\s*;/s', $this->methodContent, $match)) {
+            $modelVarName = $match[1];
+            $loadContent = $match[2];
+
+            if (! isset($this->metadata['success_responses'][200])) {
+                // Try to get the model type from the variable
+                $varContent = $this->traceVariableContent('$'.$modelVarName);
+                $modelClass = $varContent['_model'] ?? null;
+
+                // If we can't trace the variable, try to infer from variable name
+                if (! $modelClass) {
+                    $modelClass = ucfirst($modelVarName);
+                }
+
+                $modelFields = $this->extractModelFields($modelClass);
+                if (! empty($modelFields)) {
+                    // Parse the eager relations from load()
+                    $eagerRelations = $this->parseEagerLoadRelations($loadContent, $modelClass);
+
+                    $this->metadata['success_responses'][200] = [
+                        '_type' => 'model',
+                        '_model' => $modelClass,
+                        '_fields' => $modelFields,
+                        '_eager_relations' => $eagerRelations,
+                    ];
+                }
+            }
+        }
+
+        // Pattern 5: return Model::with([...])->get/find/etc - eager loading (MUST be before Pattern 6)
+        if (preg_match('/return\s+([A-Z][a-zA-Z0-9_]*)::with\s*\(([^)]+)\)\s*->\s*(?:get|all)\s*\(\s*\)\s*;/s', $this->methodContent, $match)) {
+            $modelClass = $match[1];
+            $withContent = $match[2];
+            if (! isset($this->metadata['success_responses'][200])) {
+                $modelFields = $this->extractModelFields($modelClass);
+                if (! empty($modelFields)) {
+                    // Extract relations from with() call
+                    $eagerRelations = $this->parseEagerLoadRelations($withContent, $modelClass);
+
+                    $this->metadata['success_responses'][200] = [
+                        '_type' => 'collection',
+                        '_model' => $modelClass,
+                        '_fields' => $modelFields,
+                        '_with_relations' => true,
+                        '_eager_relations' => $eagerRelations,
+                    ];
+                }
+            }
+        }
+
+        // Pattern 6: return Model::collectionMethods() - direct Eloquent collection return (without with())
         // Supports: get, all, where()->get(), latest()->get(), oldest()->get(), orderBy()->get()
         // Also handles chained methods like Model::where(...)->orderBy(...)->get()
         $collectionMethods = 'get|all';
@@ -245,14 +344,16 @@ class ControllerDocBlockGenerator
         }
 
         // Pattern 7: return Model::paginate() / simplePaginate() / cursorPaginate() - paginated results
-        $paginationMethods = 'paginate|simplePaginate|cursorPaginate';
-        if (preg_match('/return\s+([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)(?:'.$paginationMethods.')\s*\([^)]*\)\s*;/s', $this->methodContent, $match)) {
+        // Detect specific pagination type for proper response structure
+        if (preg_match('/return\s+([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)(paginate|simplePaginate|cursorPaginate)\s*\([^)]*\)\s*;/s', $this->methodContent, $match)) {
             $modelClass = $match[1];
+            $paginationType = $match[2];
             if (! isset($this->metadata['success_responses'][200])) {
                 $modelFields = $this->extractModelFields($modelClass);
                 if (! empty($modelFields)) {
                     $this->metadata['success_responses'][200] = [
-                        '_type' => 'paginated',
+                        '_type' => $paginationType === 'simplePaginate' ? 'simple_paginated' :
+                                  ($paginationType === 'cursorPaginate' ? 'cursor_paginated' : 'paginated'),
                         '_model' => $modelClass,
                         '_fields' => $modelFields,
                     ];
@@ -321,23 +422,7 @@ class ControllerDocBlockGenerator
             }
         }
 
-        // Pattern 12: return Model::with([...])->get/find/etc - eager loading
-        if (preg_match('/return\s+([A-Z][a-zA-Z0-9_]*)::with\s*\([^)]+\)\s*->\s*(?:get|all)\s*\(\s*\)\s*;/s', $this->methodContent, $match)) {
-            $modelClass = $match[1];
-            if (! isset($this->metadata['success_responses'][200])) {
-                $modelFields = $this->extractModelFields($modelClass);
-                if (! empty($modelFields)) {
-                    $this->metadata['success_responses'][200] = [
-                        '_type' => 'collection',
-                        '_model' => $modelClass,
-                        '_fields' => $modelFields,
-                        '_with_relations' => true,
-                    ];
-                }
-            }
-        }
-
-        // Pattern 13: return $model->relationMethod or $model->relation - relation access
+        // Pattern 12: return $model->relationMethod or $model->relation - relation access
         if (preg_match('/return\s+\$(\w+)->(\w+)(?:\(\))?(?:->get\(\))?\s*;/', $this->methodContent, $match)) {
             $varName = $match[1];
             $relationName = $match[2];
@@ -354,6 +439,316 @@ class ControllerDocBlockGenerator
                 }
             }
         }
+
+        // Pattern 14: return new ModelResource($model) - API Resource single model
+        if (preg_match('/return\s+new\s+([A-Z][a-zA-Z0-9_]*)Resource\s*\(\s*\$(\w+)\s*\)\s*;/s', $this->methodContent, $match)) {
+            $resourceClass = $match[1];
+            $modelVar = $match[2];
+            if (! isset($this->metadata['success_responses'][200])) {
+                $resourceFields = $this->extractApiResourceFields($resourceClass.'Resource');
+                if (! empty($resourceFields)) {
+                    $this->metadata['success_responses'][200] = [
+                        '_type' => 'api_resource',
+                        '_resource_class' => $resourceClass.'Resource',
+                        '_fields' => $resourceFields,
+                    ];
+                } else {
+                    // Fallback to model fields
+                    $modelFields = $this->extractModelFields($resourceClass);
+                    if (! empty($modelFields)) {
+                        $this->metadata['success_responses'][200] = [
+                            '_type' => 'model',
+                            '_model' => $resourceClass,
+                            '_fields' => $modelFields,
+                        ];
+                    }
+                }
+            }
+        }
+
+        // Pattern 15: return ModelResource::collection($models) - API Resource collection
+        if (preg_match('/return\s+([A-Z][a-zA-Z0-9_]*)Resource::collection\s*\(\s*\$(\w+)\s*\)\s*;/s', $this->methodContent, $match)) {
+            $resourceClass = $match[1];
+            $collectionVar = $match[2];
+            if (! isset($this->metadata['success_responses'][200])) {
+                $resourceFields = $this->extractApiResourceFields($resourceClass.'Resource');
+                // Check if it's paginated
+                $isPaginated = (bool) preg_match('/\$'.preg_quote($collectionVar, '/').'\\s*=\\s*[^;]*(?:paginate|simplePaginate|cursorPaginate)\s*\(/s', $this->methodContent);
+                if (! empty($resourceFields)) {
+                    $this->metadata['success_responses'][200] = [
+                        '_type' => $isPaginated ? 'api_resource_paginated' : 'api_resource_collection',
+                        '_resource_class' => $resourceClass.'Resource',
+                        '_fields' => $resourceFields,
+                    ];
+                } else {
+                    $modelFields = $this->extractModelFields($resourceClass);
+                    if (! empty($modelFields)) {
+                        $this->metadata['success_responses'][200] = [
+                            '_type' => $isPaginated ? 'paginated' : 'collection',
+                            '_model' => $resourceClass,
+                            '_fields' => $modelFields,
+                        ];
+                    }
+                }
+            }
+        }
+
+        // Pattern 16: return new ModelCollection($models) - API Resource Collection class
+        if (preg_match('/return\s+new\s+([A-Z][a-zA-Z0-9_]*)Collection\s*\(\s*\$(\w+)\s*\)\s*;/s', $this->methodContent, $match)) {
+            $collectionClass = $match[1];
+            $collectionVar = $match[2];
+            if (! isset($this->metadata['success_responses'][200])) {
+                // Try to find the corresponding Resource class
+                $resourceFields = $this->extractApiResourceFields($collectionClass.'Resource');
+                $isPaginated = (bool) preg_match('/\$'.preg_quote($collectionVar, '/').'\\s*=\\s*[^;]*(?:paginate|simplePaginate|cursorPaginate)\s*\(/s', $this->methodContent);
+                if (! empty($resourceFields)) {
+                    $this->metadata['success_responses'][200] = [
+                        '_type' => $isPaginated ? 'api_resource_paginated' : 'api_resource_collection',
+                        '_resource_class' => $collectionClass.'Resource',
+                        '_fields' => $resourceFields,
+                    ];
+                }
+            }
+        }
+
+        // Pattern 17: Detect withCount, withSum, withAvg, etc. in queries
+        $this->extractAggregateFields();
+    }
+
+    /**
+     * Extract fields from Laravel API Resource class
+     */
+    private function extractApiResourceFields(string $resourceClass): array
+    {
+        $fields = [];
+
+        // Try common namespaces for Resources
+        $namespaces = [
+            'App\\Http\\Resources\\',
+            'App\\Resources\\',
+        ];
+
+        $fullClassName = null;
+        foreach ($namespaces as $namespace) {
+            $testClass = $namespace.$resourceClass;
+            if (class_exists($testClass)) {
+                $fullClassName = $testClass;
+                break;
+            }
+        }
+
+        if (! $fullClassName) {
+            return $fields;
+        }
+
+        try {
+            $reflection = new \ReflectionClass($fullClassName);
+
+            // Find toArray method
+            if ($reflection->hasMethod('toArray')) {
+                $method = $reflection->getMethod('toArray');
+                $filename = $method->getFileName();
+                $startLine = $method->getStartLine();
+                $endLine = $method->getEndLine();
+
+                if ($filename && file_exists($filename)) {
+                    $lines = file($filename);
+                    $methodContent = implode('', array_slice($lines, $startLine - 1, $endLine - $startLine + 1));
+
+                    // Parse the return array in toArray
+                    $fields = $this->parseResourceToArrayMethod($methodContent);
+                }
+            }
+        } catch (\Throwable $e) {
+            // Silent fail
+        }
+
+        return $fields;
+    }
+
+    /**
+     * Parse the toArray method of an API Resource to extract fields
+     */
+    private function parseResourceToArrayMethod(string $methodContent): array
+    {
+        $fields = [];
+
+        // Match return [...] statement
+        if (preg_match('/return\s*\[([^\]]+(?:\[[^\]]*\][^\]]*)*)\]\s*;/s', $methodContent, $match)) {
+            $arrayContent = $match[1];
+
+            // Parse 'key' => $this->value or 'key' => $this->attribute patterns
+            if (preg_match_all("/['\"](\w+)['\"]\s*=>\s*\\\$this->(\w+)/", $arrayContent, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $key = $m[1];
+                    $attribute = $m[2];
+                    $fields[$key] = $this->inferFieldTypeFromName($attribute);
+                }
+            }
+
+            // Parse 'key' => value patterns (literal values)
+            if (preg_match_all("/['\"](\w+)['\"]\s*=>\s*['\"]([^'\"]+)['\"]/", $arrayContent, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $key = $m[1];
+                    $value = $m[2];
+                    if (! isset($fields[$key])) {
+                        $fields[$key] = $value;
+                    }
+                }
+            }
+
+            // Parse whenLoaded('relation') - conditional relations
+            if (preg_match_all("/['\"](\w+)['\"]\s*=>\s*\\\$this->whenLoaded\s*\(\s*['\"](\w+)['\"]/", $arrayContent, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $key = $m[1];
+                    $relation = $m[2];
+                    $fields[$key] = ['_whenLoaded' => $relation, '_type' => 'relation'];
+                }
+            }
+
+            // Parse when() conditional fields
+            if (preg_match_all("/['\"](\w+)['\"]\s*=>\s*\\\$this->when\s*\(/", $arrayContent, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $key = $m[1];
+                    if (! isset($fields[$key])) {
+                        $fields[$key] = ['_conditional' => true, '_type' => 'mixed'];
+                    }
+                }
+            }
+
+            // Parse new RelatedResource patterns
+            if (preg_match_all("/['\"](\w+)['\"]\s*=>\s*new\s+([A-Z]\w+)Resource/", $arrayContent, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $key = $m[1];
+                    $relatedResource = $m[2];
+                    $fields[$key] = ['_resource' => $relatedResource.'Resource', '_type' => 'object'];
+                }
+            }
+
+            // Parse RelatedResource::collection patterns
+            if (preg_match_all("/['\"](\w+)['\"]\s*=>\s*([A-Z]\w+)Resource::collection/", $arrayContent, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $key = $m[1];
+                    $relatedResource = $m[2];
+                    $fields[$key] = ['_resource_collection' => $relatedResource.'Resource', '_type' => 'array'];
+                }
+            }
+        }
+
+        return $fields;
+    }
+
+    /**
+     * Extract aggregate fields (withCount, withSum, etc.) from method content
+     */
+    private function extractAggregateFields(): void
+    {
+        $aggregates = [];
+
+        // Pattern: withCount('relation') or withCount(['relation1', 'relation2'])
+        if (preg_match_all("/withCount\s*\(\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $relation) {
+                $aggregates[$relation.'_count'] = 'integer';
+            }
+        }
+        if (preg_match_all("/withCount\s*\(\s*\[([^\]]+)\]/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $arrayContent) {
+                if (preg_match_all("/['\"](\w+)['\"]/", $arrayContent, $relationMatches)) {
+                    foreach ($relationMatches[1] as $relation) {
+                        $aggregates[$relation.'_count'] = 'integer';
+                    }
+                }
+            }
+        }
+
+        // Pattern: withSum('relation', 'column')
+        if (preg_match_all("/withSum\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $m) {
+                $relation = $m[1];
+                $column = $m[2];
+                $aggregates[$relation.'_sum_'.$column] = 'number';
+            }
+        }
+
+        // Pattern: withAvg('relation', 'column')
+        if (preg_match_all("/withAvg\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $m) {
+                $relation = $m[1];
+                $column = $m[2];
+                $aggregates[$relation.'_avg_'.$column] = 'number';
+            }
+        }
+
+        // Pattern: withMin('relation', 'column')
+        if (preg_match_all("/withMin\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $m) {
+                $relation = $m[1];
+                $column = $m[2];
+                $aggregates[$relation.'_min_'.$column] = 'mixed';
+            }
+        }
+
+        // Pattern: withMax('relation', 'column')
+        if (preg_match_all("/withMax\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $m) {
+                $relation = $m[1];
+                $column = $m[2];
+                $aggregates[$relation.'_max_'.$column] = 'mixed';
+            }
+        }
+
+        // Pattern: withExists('relation')
+        if (preg_match_all("/withExists\s*\(\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $relation) {
+                $aggregates[$relation.'_exists'] = 'boolean';
+            }
+        }
+
+        // Store aggregates in metadata for later use in response generation
+        if (! empty($aggregates)) {
+            $this->metadata['_aggregates'] = $aggregates;
+        }
+    }
+
+    /**
+     * Infer field type from attribute name
+     */
+    private function inferFieldTypeFromName(string $name): mixed
+    {
+        $nameLower = strtolower($name);
+
+        // ID fields
+        if ($name === 'id' || str_ends_with($nameLower, '_id')) {
+            return $this->faker->numberBetween(1, 1000);
+        }
+
+        // Date/time fields
+        if (preg_match('/(_at|_date|date_|created|updated|deleted)/', $nameLower)) {
+            return $this->faker->dateTimeThisYear()->format('Y-m-d H:i:s');
+        }
+
+        // Email fields
+        if (str_contains($nameLower, 'email')) {
+            return $this->faker->email();
+        }
+
+        // Name fields
+        if (preg_match('/(name|nome|title|titolo)/', $nameLower)) {
+            return $this->faker->words(2, true);
+        }
+
+        // Boolean fields
+        if (preg_match('/(is_|has_|can_|active|enabled|visible|published)/', $nameLower)) {
+            return $this->faker->boolean();
+        }
+
+        // Numeric fields
+        if (preg_match('/(amount|price|total|count|quantity|number|num_)/', $nameLower)) {
+            return $this->faker->numberBetween(1, 100);
+        }
+
+        // Default to the attribute name as placeholder
+        return "example_$name";
     }
 
     /**
@@ -493,13 +888,21 @@ class ControllerDocBlockGenerator
         // Try to find model assignment: $invoice = Invoice::...
         $varNameClean = preg_replace('/->.*/', '', $varName);
 
+        // Pattern 1: Variable assigned from Model::query
         if (preg_match('/\$'.preg_quote($varNameClean, '/').'\\s*=\\s*([A-Z][a-zA-Z0-9_]*)::/', $this->methodContent, $match)) {
             $modelClass = $match[1];
 
             // Try to get actual model fields
             $modelFields = $this->extractModelFields($modelClass);
             if (! empty($modelFields)) {
-                return $modelFields;
+                // Check if there's a ->load() call on this variable to include relations
+                $this->detectLoadedRelationsForVariable($varNameClean);
+
+                return [
+                    '_type' => 'model',
+                    '_model' => $modelClass,
+                    '_fields' => $modelFields,
+                ];
             }
 
             // Fallback to placeholder structure
@@ -510,7 +913,54 @@ class ControllerDocBlockGenerator
             ];
         }
 
+        // Pattern 2: Variable is a method parameter with type hint (e.g., Team $team)
+        $params = $this->reflectionMethod->getParameters();
+        foreach ($params as $param) {
+            if ($param->getName() === $varNameClean) {
+                $paramType = $param->getType();
+                if ($paramType && ! $paramType->isBuiltin()) {
+                    $className = $paramType->getName();
+                    // Extract just the class name without namespace
+                    $shortName = class_basename($className);
+
+                    // Check if it's a Model
+                    if (class_exists($className) && is_subclass_of($className, 'Illuminate\Database\Eloquent\Model')) {
+                        $modelFields = $this->extractModelFields($shortName);
+                        if (! empty($modelFields)) {
+                            // Check if there's a ->load() call on this variable
+                            $this->detectLoadedRelationsForVariable($varNameClean);
+
+                            return [
+                                '_type' => 'model',
+                                '_model' => $shortName,
+                                '_fields' => $modelFields,
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+
         return 'value';
+    }
+
+    /**
+     * Detect relations loaded on a specific variable via ->load()
+     */
+    private function detectLoadedRelationsForVariable(string $varName): void
+    {
+        // Pattern: $varName->load('relation1', 'relation2') or $varName->load(['relation1', 'relation2'])
+        if (preg_match('/\$'.preg_quote($varName, '/').'\s*->\s*load\s*\(\s*([^)]+)\s*\)/', $this->methodContent, $match)) {
+            $loadContent = $match[1];
+
+            // Extract relation names from the load call
+            if (preg_match_all("/['\"](\w+)['\"]/", $loadContent, $relationMatches)) {
+                foreach ($relationMatches[1] as $relation) {
+                    // Default to 'loaded' which is treated as a many-relation in addRelationsToResponse
+                    $this->metadata['model_relations'][$relation] = 'loaded';
+                }
+            }
+        }
     }
 
     /**
@@ -551,12 +1001,35 @@ class ControllerDocBlockGenerator
                 $fillable = $fillableProp->getValue($modelInstance) ?? [];
             }
 
+            // Get hidden fields (should not be in API responses)
+            $hidden = [];
+            if ($reflection->hasProperty('hidden')) {
+                $hiddenProp = $reflection->getProperty('hidden');
+                $hiddenProp->setAccessible(true);
+                $hidden = $hiddenProp->getValue($modelInstance) ?? [];
+            }
+
             // Get casts for type information
             $casts = [];
             if ($reflection->hasProperty('casts')) {
                 $castsProp = $reflection->getProperty('casts');
                 $castsProp->setAccessible(true);
                 $casts = $castsProp->getValue($modelInstance) ?? [];
+            }
+            // Also check casts() method for Laravel 11+ style
+            if ($reflection->hasMethod('casts')) {
+                try {
+                    $castsMethod = $reflection->getMethod('casts');
+                    if ($castsMethod->isPublic() || $castsMethod->isProtected()) {
+                        $castsMethod->setAccessible(true);
+                        $methodCasts = $castsMethod->invoke($modelInstance);
+                        if (is_array($methodCasts)) {
+                            $casts = array_merge($casts, $methodCasts);
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    // Ignore errors from casts() method
+                }
             }
 
             // Get appends (computed attributes)
@@ -570,14 +1043,20 @@ class ControllerDocBlockGenerator
             // Always include id
             $fields['id'] = 1;
 
-            // Add fillable fields with appropriate fake values
+            // Add fillable fields with appropriate fake values (excluding hidden)
             foreach ($fillable as $field) {
+                if (in_array($field, $hidden)) {
+                    continue; // Skip hidden fields
+                }
                 $type = $casts[$field] ?? 'string';
                 $fields[$field] = $this->generateFakeValueForModelField($field, $type);
             }
 
-            // Add appended attributes
+            // Add appended attributes (excluding hidden)
             foreach ($appends as $append) {
+                if (in_array($append, $hidden)) {
+                    continue;
+                }
                 $fields[$append] = $this->generateFakeValueForModelField($append, 'string');
             }
 
@@ -674,7 +1153,7 @@ class ControllerDocBlockGenerator
         if (preg_match('/^cap$|postal|zip/', $fieldLower)) {
             return $this->faker->numerify('#####');
         }
-        if (preg_match('/provincia|province|state/', $fieldLower)) {
+        if (preg_match('/provincia|province/', $fieldLower)) {
             return strtoupper($this->faker->randomLetter().$this->faker->randomLetter());
         }
         if (preg_match('/codice_univoco|sdi/', $fieldLower)) {
@@ -718,6 +1197,21 @@ class ControllerDocBlockGenerator
             return date('Y-m-d');
         }
 
+        // Boolean-like field names (is_*, has_*, *_enabled, *_active, etc.)
+        if (preg_match('/^is_|^has_|^can_|_enabled$|_active$|_verified$|_confirmed$/', $fieldLower)) {
+            return $this->faker->boolean();
+        }
+
+        // Integer-like field names (week, index, type, count, level, order, position, etc.)
+        if (preg_match('/^week$|^index$|_type$|_count$|^level$|^order$|^position$|^priority$|^sequence$|^sort$|^rank$/', $fieldLower)) {
+            return $this->faker->numberBetween(1, 10);
+        }
+
+        // State field - typically integer
+        if (preg_match('/^state$|^status$/', $fieldLower)) {
+            return $this->faker->numberBetween(0, 5);
+        }
+
         // Default string
         return $this->faker->word();
     }
@@ -727,15 +1221,43 @@ class ControllerDocBlockGenerator
      */
     private function traceVariableContent(string $varName): ?array
     {
-        $varName = preg_quote(ltrim($varName, '$'), '/');
+        $varNameClean = ltrim($varName, '$');
+        $varNameEscaped = preg_quote($varNameClean, '/');
+
+        // FIRST: Check if variable is a method parameter with a Model type hint
+        // This handles cases like: public function attachUsers(Request $request, Team $team)
+        $params = $this->reflectionMethod->getParameters();
+        foreach ($params as $param) {
+            if ($param->getName() === $varNameClean) {
+                $paramType = $param->getType();
+                if ($paramType && ! $paramType->isBuiltin()) {
+                    $className = $paramType->getName();
+                    // Check if it's a Model
+                    if (class_exists($className) && is_subclass_of($className, 'Illuminate\Database\Eloquent\Model')) {
+                        $shortName = class_basename($className);
+                        $modelFields = $this->extractModelFields($shortName);
+                        if (! empty($modelFields)) {
+                            // Detect loaded relations
+                            $this->detectLoadedRelationsForVariable($varNameClean);
+
+                            return [
+                                '_type' => 'model',
+                                '_model' => $shortName,
+                                '_fields' => $modelFields,
+                            ];
+                        }
+                    }
+                }
+            }
+        }
 
         // Check if variable is assigned from response()->json()
-        if (preg_match('/\$'.$varName.'\s*=\s*(\[[\s\S]*?\])\s*;/s', $this->methodContent, $match)) {
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*(\[[\s\S]*?\])\s*;/s', $this->methodContent, $match)) {
             return $this->parsePhpArrayToJson($match[1]);
         }
 
         // Check if variable is a transformation of another variable (collect($sourceVar)->groupBy->map)
-        if (preg_match('/\$'.$varName.'\s*=\s*collect\s*\(\s*\$(\w+)\s*\)\s*->\s*groupBy/s', $this->methodContent, $match)) {
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*collect\s*\(\s*\$(\w+)\s*\)\s*->\s*groupBy/s', $this->methodContent, $match)) {
             $sourceVar = $match[1];
 
             // Get SQL fields from the source variable
@@ -746,7 +1268,7 @@ class ControllerDocBlockGenerator
 
             $result = [
                 '_type' => 'query_result',
-                '_variable' => $varName,
+                '_variable' => $varNameClean,
                 '_source_variable' => $sourceVar,
                 '_paginated' => false,
             ];
@@ -762,9 +1284,11 @@ class ControllerDocBlockGenerator
             return $result;
         }
 
-        // Check for Model::singleModelMethods() pattern (find, findOrFail, first, etc.)
-        $singleModelMethods = 'findOrFail|find|findOr|findOrNew|first|firstOrFail|firstWhere|firstOrCreate|firstOrNew|sole';
-        if (preg_match('/\$'.$varName.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)(?:'.$singleModelMethods.')\s*\([^)]*\)\s*;/s', $this->methodContent, $match)) {
+        // Check for Model::singleModelMethods() pattern (find, findOrFail, first, create, etc.)
+        // Supports both retrieval and creation methods that return a single model instance
+        // Note: We don't try to match the closing parenthesis because create/firstOrCreate may have nested arrays
+        $singleModelMethods = 'findOrFail|find|findOr|findOrNew|first|firstOrFail|firstWhere|firstOrCreate|firstOrNew|sole|create|updateOrCreate|forceCreate';
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:.*?)(?:'.$singleModelMethods.')\s*\(/s', $this->methodContent, $match)) {
             $modelClass = $match[1];
             $modelFields = $this->extractModelFields($modelClass);
             if (! empty($modelFields)) {
@@ -778,7 +1302,7 @@ class ControllerDocBlockGenerator
 
         // Check for Model::paginate() / simplePaginate() / cursorPaginate() pattern
         $paginationMethods = 'paginate|simplePaginate|cursorPaginate';
-        if (preg_match('/\$'.$varName.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)(?:'.$paginationMethods.')\s*\([^)]*\)\s*;/s', $this->methodContent, $match)) {
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)(?:'.$paginationMethods.')\s*\([^)]*\)\s*;/s', $this->methodContent, $match)) {
             $modelClass = $match[1];
             $modelFields = $this->extractModelFields($modelClass);
             if (! empty($modelFields)) {
@@ -792,7 +1316,7 @@ class ControllerDocBlockGenerator
         }
 
         // Check for Model::pluck() pattern
-        if (preg_match('/\$'.$varName.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)pluck\s*\(\s*[\'"](\w+)[\'"]/s', $this->methodContent, $match)) {
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)pluck\s*\(\s*[\'"](\w+)[\'"]/s', $this->methodContent, $match)) {
             $modelClass = $match[1];
             $columnName = $match[2];
 
@@ -804,7 +1328,7 @@ class ControllerDocBlockGenerator
         }
 
         // Check for Model::value() pattern
-        if (preg_match('/\$'.$varName.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)value\s*\(\s*[\'"](\w+)[\'"]/s', $this->methodContent, $match)) {
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)value\s*\(\s*[\'"](\w+)[\'"]/s', $this->methodContent, $match)) {
             $modelClass = $match[1];
             $columnName = $match[2];
 
@@ -817,7 +1341,7 @@ class ControllerDocBlockGenerator
 
         // Check for scalar methods: count, exists, doesntExist, max, min, avg, sum
         $scalarMethods = 'count|exists|doesntExist|max|min|avg|sum|average';
-        if (preg_match('/\$'.$varName.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)('.$scalarMethods.')\s*\([^)]*\)\s*;/s', $this->methodContent, $match)) {
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)('.$scalarMethods.')\s*\([^)]*\)\s*;/s', $this->methodContent, $match)) {
             $method = $match[2];
             if (in_array($method, ['exists', 'doesntExist'])) {
                 return [
@@ -835,7 +1359,7 @@ class ControllerDocBlockGenerator
         // Check if it's a collection/query result (Model::get(), Model::all(), etc.)
         // Supports chained methods like Model::where(...)->orderBy(...)->get()
         $collectionMethods = 'get|all|findMany';
-        if (preg_match('/\$'.$varName.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)(?:'.$collectionMethods.')\s*\(/s', $this->methodContent, $match)) {
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*([A-Z][a-zA-Z0-9_]*)::(?:[^;]*?)(?:'.$collectionMethods.')\s*\(/s', $this->methodContent, $match)) {
             $modelClass = $match[1];
             $modelFields = $this->extractModelFields($modelClass);
             if (! empty($modelFields)) {
@@ -848,22 +1372,54 @@ class ControllerDocBlockGenerator
             }
         }
 
+        // Check for auth()->user() pattern - returns authenticated User model
+        // MUST be checked BEFORE the legacy ->get()/->select() pattern which is too greedy
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*auth\s*\(\s*\)\s*->\s*user\s*\(\s*\)/s', $this->methodContent)) {
+            $modelFields = $this->extractModelFields('User');
+            if (! empty($modelFields)) {
+                // Check if the variable is loaded with relations: $user->load([...])
+                $eagerRelations = [];
+                if (preg_match('/\$'.$varNameEscaped.'\s*->\s*load\s*\(\s*\[([^\]]+)\]/s', $this->methodContent, $loadMatch)) {
+                    $eagerRelations = $this->parseEagerLoadRelations($loadMatch[1], 'User');
+                }
+
+                return [
+                    '_type' => 'model',
+                    '_model' => 'User',
+                    '_fields' => $modelFields,
+                    '_eager_relations' => $eagerRelations,
+                ];
+            }
+        }
+
+        // Check for $varData = $sourceVar->toArray() pattern - traces back to source model
+        // MUST be checked BEFORE the legacy ->get()/->select() pattern which is too greedy
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*\$(\w+)\s*->\s*toArray\s*\(\s*\)/s', $this->methodContent, $match)) {
+            $sourceVar = $match[1];
+            // Recursively trace the source variable to find the model
+            $sourceContent = $this->traceVariableContent('$'.$sourceVar);
+            if ($sourceContent && isset($sourceContent['_type']) && $sourceContent['_type'] === 'model') {
+                // Return the same model info but indicate it's been converted to array
+                return $sourceContent;
+            }
+        }
+
         // Check if it's a collection/query result (legacy patterns: ->get(), DB::select, etc.)
-        if (preg_match('/\$'.$varName.'\s*=\s*.*?(?:->get\(|->select\(|DB::select|DB::connection\([^)]+\)\s*->\s*select)/s', $this->methodContent)) {
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*.*?(?:->get\(|->select\(|DB::select|DB::connection\([^)]+\)\s*->\s*select)/s', $this->methodContent)) {
             $result = [
                 '_type' => 'query_result',
-                '_variable' => $varName,
+                '_variable' => $varNameClean,
                 '_paginated' => $this->usesPagination(),
             ];
 
             // Try to extract SQL fields from DB::select queries
-            $sqlFields = $this->extractSqlSelectFields($varName);
+            $sqlFields = $this->extractSqlSelectFields($varNameClean);
             if (! empty($sqlFields)) {
                 $result['_sql_fields'] = $sqlFields;
             }
 
             // Check if the result is transformed with groupBy/map (produces nested structure)
-            $transformation = $this->detectCollectionTransformation($varName);
+            $transformation = $this->detectCollectionTransformation($varNameClean);
             if ($transformation) {
                 $result['_transformation'] = $transformation;
             }
@@ -871,7 +1427,117 @@ class ControllerDocBlockGenerator
             return $result;
         }
 
+        // Check for simple map transformation: $var = $source->map(function($item) { return [...]; })
+        // This handles patterns like: $data = $teams->map(function ($team) { return ['id' => $team->id, ...]; });
+        if (preg_match('/\$'.$varNameEscaped.'\s*=\s*\$(\w+)\s*->\s*map\s*\(\s*function\s*\(\s*\$\w+\s*\)\s*\{/s', $this->methodContent, $match)) {
+            $sourceVar = $match[1];
+            $mapFields = $this->extractMapReturnFields($varNameClean);
+
+            if (! empty($mapFields)) {
+                return [
+                    '_type' => 'mapped_collection',
+                    '_source_variable' => $sourceVar,
+                    '_fields' => $mapFields,
+                ];
+            }
+        }
+
         return null;
+    }
+
+    /**
+     * Extract fields from a map function's return array.
+     * Handles: $var = $source->map(function ($item) { return ['field' => $item->field, ...]; });
+     */
+    private function extractMapReturnFields(string $varName): array
+    {
+        $varName = preg_quote(ltrim($varName, '$'), '/');
+
+        // Find the map function and extract the return array
+        $pattern = '/\$'.$varName.'\s*=\s*\$\w+\s*->\s*map\s*\(\s*function\s*\(\s*\$(\w+)\s*\)\s*\{\s*return\s*\[/s';
+
+        if (preg_match($pattern, $this->methodContent, $match, PREG_OFFSET_CAPTURE)) {
+            $itemVar = $match[1][0];
+            $startOffset = $match[0][1] + strlen($match[0][0]);
+
+            // Extract the balanced array content
+            $arrayContent = $this->extractBalancedBrackets($this->methodContent, $startOffset - 1);
+
+            if ($arrayContent) {
+                return $this->parseMapArrayFields($arrayContent, $itemVar);
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * Parse the fields from a map return array.
+     * Input: ['id' => $team->id, 'name' => $team->name, 'total_users' => $team->users_count]
+     * Output: ['id' => 'integer', 'name' => 'string', 'total_users' => 'integer']
+     */
+    private function parseMapArrayFields(string $arrayContent, string $itemVar): array
+    {
+        $fields = [];
+
+        // Remove outer brackets
+        $arrayContent = trim($arrayContent);
+        if (str_starts_with($arrayContent, '[')) {
+            $arrayContent = substr($arrayContent, 1);
+        }
+        if (str_ends_with($arrayContent, ']')) {
+            $arrayContent = substr($arrayContent, 0, -1);
+        }
+
+        // Match patterns like: 'key' => $var->property or 'key' => $var->method()
+        // Also match: 'key' => value (literal values)
+        $itemVarPattern = preg_quote($itemVar, '/');
+        $pattern = "/['\"](\w+)['\"]\s*=>\s*(?:\\\${$itemVarPattern}->(\w+)(?:_count)?|\\\${$itemVarPattern}->(\w+)\(\)|([^,\]]+))/";
+
+        if (preg_match_all($pattern, $arrayContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $fieldName = $match[1];
+                $property = $match[2] ?? $match[3] ?? null;
+                $literalValue = $match[4] ?? null;
+
+                // Infer type from field name or property
+                $type = $this->inferFieldType($fieldName, $property, $literalValue);
+                $fields[$fieldName] = $type;
+            }
+        }
+
+        return $fields;
+    }
+
+    /**
+     * Infer field type from field name, property name, or literal value
+     */
+    private function inferFieldType(string $fieldName, ?string $property, ?string $literalValue): string
+    {
+        $fieldLower = strtolower($fieldName);
+
+        // Check for common patterns
+        if (preg_match('/^id$|_id$/', $fieldLower)) {
+            return 'integer';
+        }
+        if (preg_match('/total_|_count$|count_|num_|number_/', $fieldLower)) {
+            return 'integer';
+        }
+        if (preg_match('/^is_|^has_|^can_|_flag$|active|enabled|visible/', $fieldLower)) {
+            return 'boolean';
+        }
+        if (preg_match('/email/', $fieldLower)) {
+            return 'string';
+        }
+        if (preg_match('/date|_at$|time|created|updated|deleted/', $fieldLower)) {
+            return 'datetime';
+        }
+        if (preg_match('/price|amount|total|sum|cost|fee|balance/', $fieldLower)) {
+            return 'number';
+        }
+
+        // Default to string
+        return 'string';
     }
 
     /**
@@ -1258,10 +1924,8 @@ class ControllerDocBlockGenerator
             $lines[] = ' *';
         }
 
-        // Authentication
-        if (in_array('auth:sanctum', $this->metadata['middleware']) ||
-            in_array('auth:api', $this->metadata['middleware']) ||
-            in_array('auth', $this->metadata['middleware'])) {
+        // Authentication - check route and controller middleware for any auth patterns
+        if ($this->requiresAuthentication()) {
             $lines[] = ' * @authenticated';
             $lines[] = ' *';
         }
@@ -1318,7 +1982,7 @@ class ControllerDocBlockGenerator
     }
 
     /**
-     * Extract validation rules from $request->validate() or FormRequest
+     * Extract validation rules from $request->validate(), Validator::make(), or FormRequest
      */
     private function extractValidationRules(): void
     {
@@ -1329,6 +1993,19 @@ class ControllerDocBlockGenerator
             $start = strpos($this->methodContent, '->validate([');
             if ($start !== false) {
                 $start = strpos($this->methodContent, '[', $start);
+                $rulesContent = $this->extractBalancedBrackets($this->methodContent, $start);
+                if ($rulesContent) {
+                    $this->parseValidationRules($rulesContent);
+                }
+            }
+        }
+        // Match Validator::make($request->all(), [...]) pattern
+        elseif (preg_match('/Validator::make\s*\(\s*\$\w+(?:->all\(\))?\s*,\s*\[/s', $this->methodContent)) {
+            // Find the second array (the rules array) in Validator::make()
+            if (preg_match('/Validator::make\s*\(\s*\$\w+(?:->all\(\))?\s*,\s*\[/s', $this->methodContent, $match, PREG_OFFSET_CAPTURE)) {
+                $matchPos = $match[0][1];
+                $matchText = $match[0][0];
+                $start = $matchPos + strlen($matchText) - 1; // Position of the opening bracket
                 $rulesContent = $this->extractBalancedBrackets($this->methodContent, $start);
                 if ($rulesContent) {
                     $this->parseValidationRules($rulesContent);
@@ -1451,7 +2128,10 @@ class ControllerDocBlockGenerator
      */
     private function extractMiddleware(): void
     {
-        // Check __construct for middleware
+        // First, extract middleware from the route definition (Laravel router)
+        $this->extractRouteMiddleware();
+
+        // Also check __construct for controller-level middleware
         if ($this->reflectionClass->hasMethod('__construct')) {
             $constructor = $this->reflectionClass->getMethod('__construct');
             $filename = $constructor->getFileName();
@@ -1469,10 +2149,404 @@ class ControllerDocBlockGenerator
                         $methods = explode(',', str_replace([' ', "'", '"'], '', $match[2]));
 
                         if (in_array($this->methodName, $methods)) {
-                            $this->metadata['middleware'][] = $middleware;
+                            if (! in_array($middleware, $this->metadata['middleware'])) {
+                                $this->metadata['middleware'][] = $middleware;
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * Extract middleware from Laravel route definition
+     */
+    private function extractRouteMiddleware(): void
+    {
+        try {
+            $routes = app('router')->getRoutes();
+
+            foreach ($routes as $route) {
+                $action = $route->getAction();
+
+                // Check if the route uses this controller and method
+                $expectedAction = $this->controllerClass.'@'.$this->methodName;
+                $controllerAction = $action['controller'] ?? ($action['uses'] ?? null);
+
+                if ($controllerAction === $expectedAction) {
+                    // Get middleware from route
+                    $middleware = $route->gatherMiddleware();
+
+                    foreach ($middleware as $mw) {
+                        // Handle middleware that might be a class name or alias
+                        if (is_string($mw) && ! in_array($mw, $this->metadata['middleware'])) {
+                            $this->metadata['middleware'][] = $mw;
+                        }
+                    }
+
+                    break; // Found the route, no need to continue
+                }
+            }
+        } catch (\Throwable $e) {
+            // Silent fail - route discovery might not work in all contexts
+        }
+    }
+
+    /**
+     * Check if middleware indicates authentication is required
+     * Supports standard Laravel auth middleware and custom auth middleware
+     */
+    private function isAuthMiddleware(string $middleware): bool
+    {
+        // Standard Laravel auth middleware
+        $standardAuth = [
+            'auth',
+            'auth:sanctum',
+            'auth:api',
+            'auth:web',
+        ];
+
+        if (in_array($middleware, $standardAuth)) {
+            return true;
+        }
+
+        // Check for auth: prefix with any guard
+        if (str_starts_with($middleware, 'auth:')) {
+            return true;
+        }
+
+        // Check for custom auth middleware patterns (case insensitive)
+        // Common patterns: auth.custom, auth.cognito, authenticate, etc.
+        $lowercaseMiddleware = strtolower($middleware);
+
+        // Patterns that indicate authentication
+        $authPatterns = [
+            'auth.',           // auth.cognito, auth.cognitoUsers, etc.
+            'authenticate',    // AuthenticateMiddleware
+            'verify.token',    // Token verification
+            'jwt',             // JWT authentication
+            'passport',        // Laravel Passport
+        ];
+
+        foreach ($authPatterns as $pattern) {
+            if (str_contains($lowercaseMiddleware, $pattern)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if any middleware in the list requires authentication
+     */
+    private function requiresAuthentication(): bool
+    {
+        foreach ($this->metadata['middleware'] as $middleware) {
+            if ($this->isAuthMiddleware($middleware)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Extract query parameters from method code
+     * Detects $request->query(), $request->input(), $request->get(), etc.
+     */
+    private function extractQueryParameters(): void
+    {
+        // Extract query params for GET-like methods or any method using query params
+        $isGetMethod = in_array($this->methodName, ['index', 'show', 'search', 'list', 'filter']) ||
+                       str_contains(strtolower($this->methodName), 'search') ||
+                       str_contains(strtolower($this->methodName), 'find') ||
+                       str_contains(strtolower($this->methodName), 'list') ||
+                       str_contains(strtolower($this->methodName), 'filter') ||
+                       str_contains(strtolower($this->methodName), 'get');
+
+        // Also check if method uses query() function
+        $usesQuery = (bool) preg_match('/\$request->query\s*\(/', $this->methodContent);
+
+        if (! $isGetMethod && ! $usesQuery) {
+            return;
+        }
+
+        $queryParams = [];
+
+        // Pattern 1: $request->query('param') or $request->query('param', 'default')
+        if (preg_match_all("/\\\$request->query\s*\(\s*['\"](\w+)['\"](?:\s*,\s*([^)]+))?\s*\)/", $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $m) {
+                $param = $m[1];
+                $default = isset($m[2]) ? trim($m[2], "' \"") : null;
+                $queryParams[$param] = [
+                    'type' => $this->inferParamTypeFromDefault($default),
+                    'required' => false,
+                    'default' => $default,
+                ];
+            }
+        }
+
+        // Pattern 2: $request->input('param') or $request->input('param', default)
+        if (preg_match_all("/\\\$request->input\s*\(\s*['\"](\w+)['\"](?:\s*,\s*([^)]+))?\s*\)/", $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $m) {
+                $param = $m[1];
+                $default = isset($m[2]) ? trim($m[2], "' \"") : null;
+                if (! isset($queryParams[$param])) {
+                    $queryParams[$param] = [
+                        'type' => $this->inferParamTypeFromDefault($default),
+                        'required' => false,
+                        'default' => $default,
+                    ];
+                }
+            }
+        }
+
+        // Pattern 3: $request->get('param')
+        if (preg_match_all("/\\\$request->get\s*\(\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $param) {
+                if (! isset($queryParams[$param])) {
+                    $queryParams[$param] = [
+                        'type' => 'string',
+                        'required' => false,
+                    ];
+                }
+            }
+        }
+
+        // Pattern 4: $request->has('param') - often indicates optional param
+        if (preg_match_all("/\\\$request->has\s*\(\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $param) {
+                if (! isset($queryParams[$param])) {
+                    $queryParams[$param] = [
+                        'type' => 'string',
+                        'required' => false,
+                    ];
+                }
+            }
+        }
+
+        // Pattern 5: $request->filled('param') - non-empty param
+        if (preg_match_all("/\\\$request->filled\s*\(\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $param) {
+                if (! isset($queryParams[$param])) {
+                    $queryParams[$param] = [
+                        'type' => 'string',
+                        'required' => false,
+                    ];
+                }
+            }
+        }
+
+        // Pattern 6: when($request->param) or when($request->has('param'), ...) - conditional queries
+        if (preg_match_all("/when\s*\(\s*\\\$request->(\w+)/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $param) {
+                if ($param !== 'user' && ! isset($queryParams[$param])) {
+                    $queryParams[$param] = [
+                        'type' => 'string',
+                        'required' => false,
+                    ];
+                }
+            }
+        }
+
+        // Pattern 7: Common filter/sort parameters
+        if (preg_match('/orderBy\s*\(\s*\$request/', $this->methodContent)) {
+            if (! isset($queryParams['sort_by'])) {
+                $queryParams['sort_by'] = [
+                    'type' => 'string',
+                    'required' => false,
+                    'description' => 'Field to sort by',
+                ];
+            }
+            if (! isset($queryParams['sort_dir'])) {
+                $queryParams['sort_dir'] = [
+                    'type' => 'string',
+                    'required' => false,
+                    'description' => 'Sort direction (asc/desc)',
+                ];
+            }
+        }
+
+        // Pattern 8: Pagination parameters
+        if (preg_match('/paginate\s*\(\s*\$request/', $this->methodContent)) {
+            if (! isset($queryParams['per_page'])) {
+                $queryParams['per_page'] = [
+                    'type' => 'integer',
+                    'required' => false,
+                    'description' => 'Number of items per page',
+                ];
+            }
+        }
+
+        // Pattern 9: Search parameter
+        if (preg_match('/where\s*\([^)]*like[^)]*\$request/', $this->methodContent, $m) ||
+            preg_match('/search|keyword|q\b/', implode('', array_keys($queryParams)))) {
+            if (! isset($queryParams['search']) && ! isset($queryParams['q'])) {
+                // Check if there's a search-like variable
+                if (preg_match('/\$(?:search|keyword|q)\s*=\s*\$request/', $this->methodContent)) {
+                    $queryParams['search'] = [
+                        'type' => 'string',
+                        'required' => false,
+                        'description' => 'Search term',
+                    ];
+                }
+            }
+        }
+
+        // Store in metadata
+        if (! empty($queryParams)) {
+            $this->metadata['query_params'] = $queryParams;
+        }
+    }
+
+    /**
+     * Infer parameter type from default value
+     */
+    private function inferParamTypeFromDefault(?string $default): string
+    {
+        if ($default === null) {
+            return 'string';
+        }
+
+        if (is_numeric($default)) {
+            return str_contains($default, '.') ? 'number' : 'integer';
+        }
+
+        if (in_array(strtolower($default), ['true', 'false'])) {
+            return 'boolean';
+        }
+
+        if ($default === 'null') {
+            return 'string';
+        }
+
+        return 'string';
+    }
+
+    /**
+     * Extract file upload parameters from method code
+     */
+    private function extractFileUploads(): void
+    {
+        $fileParams = [];
+
+        // Pattern 1: $request->file('param')
+        if (preg_match_all("/\\\$request->file\s*\(\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $param) {
+                $fileParams[$param] = [
+                    'type' => 'file',
+                    'required' => true,
+                ];
+            }
+        }
+
+        // Pattern 2: $request->hasFile('param')
+        if (preg_match_all("/\\\$request->hasFile\s*\(\s*['\"](\w+)['\"]\s*\)/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $param) {
+                if (! isset($fileParams[$param])) {
+                    $fileParams[$param] = [
+                        'type' => 'file',
+                        'required' => false, // hasFile implies it might not be present
+                    ];
+                } else {
+                    $fileParams[$param]['required'] = false;
+                }
+            }
+        }
+
+        // Pattern 3: Validation rules for files (from FormRequest or inline)
+        if (! empty($this->metadata['validations'])) {
+            foreach ($this->metadata['validations'] as $field => $rules) {
+                if (preg_match('/(file|image|mimes|mimetypes)/', $rules)) {
+                    if (! isset($fileParams[$field])) {
+                        $fileParams[$field] = [
+                            'type' => 'file',
+                            'required' => str_contains($rules, 'required'),
+                            'mimes' => $this->extractMimesFromRules($rules),
+                        ];
+                    }
+                }
+            }
+        }
+
+        // Store in metadata
+        if (! empty($fileParams)) {
+            $this->metadata['file_uploads'] = $fileParams;
+        }
+    }
+
+    /**
+     * Extract mime types from validation rules
+     */
+    private function extractMimesFromRules(string $rules): ?string
+    {
+        if (preg_match('/mimes:([^|]+)/', $rules, $m)) {
+            return $m[1];
+        }
+        if (preg_match('/mimetypes:([^|]+)/', $rules, $m)) {
+            return $m[1];
+        }
+
+        return null;
+    }
+
+    /**
+     * Extract authorization checks from method code
+     */
+    private function extractAuthorization(): void
+    {
+        $authChecks = [];
+
+        // Pattern 1: $this->authorize('action', Model::class)
+        if (preg_match_all("/\\\$this->authorize\s*\(\s*['\"](\w+)['\"]/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $action) {
+                $authChecks[] = [
+                    'type' => 'policy',
+                    'action' => $action,
+                ];
+            }
+        }
+
+        // Pattern 2: Gate::allows('action') or Gate::denies('action')
+        if (preg_match_all("/Gate::(allows|denies|check)\s*\(\s*['\"]([^'\"]+)['\"]/", $this->methodContent, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $m) {
+                $authChecks[] = [
+                    'type' => 'gate',
+                    'method' => $m[1],
+                    'ability' => $m[2],
+                ];
+            }
+        }
+
+        // Pattern 3: $user->can('action') or $user->cannot('action')
+        if (preg_match_all("/->can(?:not)?\s*\(\s*['\"]([^'\"]+)['\"]/", $this->methodContent, $matches)) {
+            foreach ($matches[1] as $ability) {
+                $authChecks[] = [
+                    'type' => 'can',
+                    'ability' => $ability,
+                ];
+            }
+        }
+
+        // Pattern 4: abort_if(!$user->can(...), 403)
+        if (preg_match('/abort(?:_if|_unless)?\s*\([^,]*,\s*403/', $this->methodContent)) {
+            $authChecks[] = [
+                'type' => 'abort',
+                'status' => 403,
+            ];
+        }
+
+        // If we have auth checks, add 403 error response
+        if (! empty($authChecks)) {
+            $this->metadata['authorization'] = $authChecks;
+
+            // Auto-add 403 response if not already present
+            if (! isset($this->metadata['responses'][403])) {
+                $this->metadata['responses'][403] = [
+                    'message' => 'This action is unauthorized.',
+                ];
             }
         }
     }
@@ -1850,7 +2924,7 @@ class ControllerDocBlockGenerator
      */
     private function extractLoadedRelations(): void
     {
-        // Match $model->load([...]) or ::with([...])
+        // Pattern 1: Match $model->load([...]) or ::with([...]) - array syntax
         if (preg_match_all('/(?:->load|::with)\s*\(\s*\[([^\]]+)\]/s', $this->methodContent, $matches)) {
             foreach ($matches[1] as $relationsBlock) {
                 // Look for relation keys in the array - match 'relationName' => function pattern
@@ -1878,6 +2952,73 @@ class ControllerDocBlockGenerator
                     }
                 }
             }
+        }
+
+        // Pattern 2: Match $model->load('rel1', 'rel2') - comma-separated string arguments
+        // This handles: $team->load('users', 'patients') or $model->load('relation')
+        if (preg_match_all('/->load\s*\(\s*([^)\[\]]+)\)/s', $this->methodContent, $matches)) {
+            foreach ($matches[1] as $argsBlock) {
+                // Skip if it contains [ which means it's array syntax (handled above)
+                if (str_contains($argsBlock, '[')) {
+                    continue;
+                }
+                // Match quoted strings: 'relationName' or "relationName"
+                if (preg_match_all("/['\"](\w+)['\"]/", $argsBlock, $relationMatches)) {
+                    foreach ($relationMatches[1] as $relationName) {
+                        $relationName = trim($relationName);
+                        if (! empty($relationName) && ! isset($this->metadata['model_relations'][$relationName])) {
+                            $this->metadata['model_relations'][$relationName] = 'loaded';
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 3: Match return response()->json($model->load('rel1', 'rel2'), ...)
+        // This handles inline load in return statements, including nested relations like 'questionnaires.answers'
+        if (preg_match_all('/return\s+response\(\)\s*->\s*json\s*\(\s*\$(\w+)->load\s*\(\s*([^)]+)\)/s', $this->methodContent, $matches)) {
+            $modelVarName = $matches[1][0] ?? null;
+            foreach ($matches[2] as $argsBlock) {
+                // Match relation names including nested (e.g., 'questionnaires.answers')
+                if (preg_match_all("/['\"]([a-zA-Z_.]+)['\"]/", $argsBlock, $relationMatches)) {
+                    foreach ($relationMatches[1] as $relationPath) {
+                        $relationPath = trim($relationPath);
+                        if (! empty($relationPath)) {
+                            // For nested relations, parse and build the structure
+                            $this->parseAndStoreNestedRelation($relationPath, $modelVarName);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Parse a nested relation path and store it in metadata
+     * e.g., 'questionnaires.answers' becomes nested structure
+     */
+    private function parseAndStoreNestedRelation(string $relationPath, ?string $modelVarName): void
+    {
+        $parts = explode('.', $relationPath);
+        $rootRelation = $parts[0];
+
+        // Store the root relation
+        if (! isset($this->metadata['model_relations'][$rootRelation])) {
+            $this->metadata['model_relations'][$rootRelation] = 'loaded';
+        }
+
+        // If there are nested relations, store them for the eager loading system
+        if (count($parts) > 1 && ! empty($this->metadata['model_class'])) {
+            // Build nested eager relations structure
+            if (! isset($this->metadata['eager_relations'])) {
+                $this->metadata['eager_relations'] = [];
+            }
+
+            $eagerRelations = $this->parseEagerLoadRelations("'{$relationPath}'", $this->metadata['model_class']);
+            $this->metadata['eager_relations'] = array_merge_recursive(
+                $this->metadata['eager_relations'],
+                $eagerRelations
+            );
         }
     }
 
@@ -2270,7 +3411,86 @@ class ControllerDocBlockGenerator
             array_unshift($lines, ' *');
         }
 
+        // Add query parameters for GET methods
+        if (! empty($this->metadata['query_params'])) {
+            foreach ($this->metadata['query_params'] as $param => $config) {
+                $type = $config['type'] ?? 'string';
+                $required = ($config['required'] ?? false) ? 'required' : 'optional';
+                $description = $config['description'] ?? "Filter by {$param}.";
+                $example = $this->generateQueryParamExample($param, $type, $config['default'] ?? null);
+                $lines[] = " * @queryParam {$param} {$type} {$required} {$description} Example: {$example}";
+            }
+            if (! empty($lines)) {
+                $lines[] = ' *';
+            }
+        }
+
+        // Add file upload parameters
+        if (! empty($this->metadata['file_uploads'])) {
+            foreach ($this->metadata['file_uploads'] as $param => $config) {
+                $required = ($config['required'] ?? true) ? 'required' : 'optional';
+                $mimes = $config['mimes'] ?? null;
+                $description = $mimes ? "Accepted types: {$mimes}." : 'File upload.';
+                $lines[] = " * @bodyParam {$param} file {$required} {$description}";
+            }
+            if (! empty($lines)) {
+                $lines[] = ' *';
+            }
+        }
+
         return $lines;
+    }
+
+    /**
+     * Generate example value for a query parameter
+     */
+    private function generateQueryParamExample(string $param, string $type, ?string $default): string
+    {
+        if ($default !== null && $default !== 'null') {
+            return $default;
+        }
+
+        $paramLower = strtolower($param);
+
+        // Common patterns
+        if ($type === 'integer') {
+            if (str_contains($paramLower, 'page')) {
+                return '1';
+            }
+            if (str_contains($paramLower, 'per_page') || str_contains($paramLower, 'limit')) {
+                return '15';
+            }
+
+            return (string) $this->faker->numberBetween(1, 100);
+        }
+
+        if ($type === 'boolean') {
+            return 'true';
+        }
+
+        // Search/filter params
+        if (str_contains($paramLower, 'search') || str_contains($paramLower, 'q') || str_contains($paramLower, 'keyword')) {
+            return 'example';
+        }
+
+        // Sort params
+        if (str_contains($paramLower, 'sort') || str_contains($paramLower, 'order')) {
+            if (str_contains($paramLower, 'dir')) {
+                return 'asc';
+            }
+
+            return 'created_at';
+        }
+
+        // Status/type params
+        if (str_contains($paramLower, 'status')) {
+            return 'active';
+        }
+        if (str_contains($paramLower, 'type')) {
+            return 'default';
+        }
+
+        return $this->faker->word();
     }
 
     /**
@@ -2586,15 +3806,25 @@ class ControllerDocBlockGenerator
                     } elseif (isset($responseData['_type']) && $responseData['_type'] === 'collection') {
                         // Generate collection response (array of models) from Model::get() / Model::all()
                         $modelFields = $responseData['_fields'] ?? [];
-                        $lines = array_merge($lines, $this->generateCollectionResponse($statusCode, $modelFields));
+                        $eagerRelations = $responseData['_eager_relations'] ?? [];
+                        $lines = array_merge($lines, $this->generateCollectionResponse($statusCode, $modelFields, $eagerRelations));
                     } elseif (isset($responseData['_type']) && $responseData['_type'] === 'model') {
-                        // Generate single model response from Model::findOrFail() / Model::find()
+                        // Generate single model response from Model::findOrFail() / Model::find() / ->load()
                         $modelFields = $responseData['_fields'] ?? [];
-                        $lines = array_merge($lines, $this->generateSingleModelResponse($statusCode, $modelFields));
+                        $eagerRelations = $responseData['_eager_relations'] ?? [];
+                        $lines = array_merge($lines, $this->generateSingleModelResponse($statusCode, $modelFields, $eagerRelations));
                     } elseif (isset($responseData['_type']) && $responseData['_type'] === 'paginated') {
-                        // Generate paginated response from Model::paginate() / simplePaginate() / cursorPaginate()
+                        // Generate paginated response from Model::paginate()
                         $modelFields = $responseData['_fields'] ?? [];
                         $lines = array_merge($lines, $this->generatePaginatedResponse($statusCode, $modelFields));
+                    } elseif (isset($responseData['_type']) && $responseData['_type'] === 'simple_paginated') {
+                        // Generate simplePaginate response (no total count)
+                        $modelFields = $responseData['_fields'] ?? [];
+                        $lines = array_merge($lines, $this->generateSimplePaginatedResponse($statusCode, $modelFields));
+                    } elseif (isset($responseData['_type']) && $responseData['_type'] === 'cursor_paginated') {
+                        // Generate cursorPaginate response (cursor-based)
+                        $modelFields = $responseData['_fields'] ?? [];
+                        $lines = array_merge($lines, $this->generateCursorPaginatedResponse($statusCode, $modelFields));
                     } elseif (isset($responseData['_type']) && $responseData['_type'] === 'pluck') {
                         // Generate pluck response (array of single column values)
                         $columnName = $responseData['_column'] ?? 'value';
@@ -2607,10 +3837,29 @@ class ControllerDocBlockGenerator
                         // Generate scalar response (count, exists, etc.)
                         $scalarType = $responseData['_scalar_type'] ?? 'integer';
                         $lines = array_merge($lines, $this->generateScalarResponse($statusCode, $scalarType));
+                    } elseif (isset($responseData['_type']) && $responseData['_type'] === 'binary_download') {
+                        // Generate binary download response (response()->download())
+                        $lines = array_merge($lines, $this->generateBinaryDownloadResponse($statusCode));
                     } elseif (isset($responseData['_type']) && $responseData['_type'] === 'relation') {
                         // Generate relation response
                         $relationName = $responseData['_relation'] ?? 'items';
                         $lines = array_merge($lines, $this->generateRelationResponse($statusCode, $relationName));
+                    } elseif (isset($responseData['_type']) && $responseData['_type'] === 'mapped_collection') {
+                        // Generate mapped collection response (transformed with ->map())
+                        $fields = $responseData['_fields'] ?? [];
+                        $lines = array_merge($lines, $this->generateMappedCollectionResponse($statusCode, $fields));
+                    } elseif (isset($responseData['_type']) && $responseData['_type'] === 'api_resource') {
+                        // Generate single API Resource response
+                        $fields = $responseData['_fields'] ?? [];
+                        $lines = array_merge($lines, $this->generateApiResourceResponse($statusCode, $fields));
+                    } elseif (isset($responseData['_type']) && $responseData['_type'] === 'api_resource_collection') {
+                        // Generate API Resource collection response
+                        $fields = $responseData['_fields'] ?? [];
+                        $lines = array_merge($lines, $this->generateApiResourceCollectionResponse($statusCode, $fields));
+                    } elseif (isset($responseData['_type']) && $responseData['_type'] === 'api_resource_paginated') {
+                        // Generate paginated API Resource response
+                        $fields = $responseData['_fields'] ?? [];
+                        $lines = array_merge($lines, $this->generateApiResourcePaginatedResponse($statusCode, $fields));
                     } else {
                         // Use the actual parsed response structure
                         $lines[] = " * @response {$statusCode} {";
@@ -2619,16 +3868,31 @@ class ControllerDocBlockGenerator
                         foreach ($responseData as $key => $value) {
                             $comma = ($key !== $lastKey) ? ',' : '';
                             if (is_array($value)) {
-                                // Format nested object on multiple lines
-                                $lines[] = " *   \"{$key}\": {";
-                                $nestedKeys = array_keys($value);
-                                $lastNestedKey = end($nestedKeys);
-                                foreach ($value as $nestedKey => $nestedValue) {
-                                    $nestedComma = ($nestedKey !== $lastNestedKey) ? ',' : '';
-                                    $formattedNestedValue = $this->formatResponseValue($nestedValue);
-                                    $lines[] = " *     \"{$nestedKey}\": {$formattedNestedValue}{$nestedComma}";
+                                // Check if it's a model structure that needs to be expanded
+                                if (isset($value['_type']) && $value['_type'] === 'model' && isset($value['_fields'])) {
+                                    // Expand the model fields
+                                    $lines[] = " *   \"{$key}\": {";
+                                    $modelFields = $value['_fields'];
+                                    $fieldKeys = array_keys($modelFields);
+                                    $lastFieldKey = end($fieldKeys);
+                                    foreach ($modelFields as $fieldName => $fieldValue) {
+                                        $fieldComma = ($fieldName !== $lastFieldKey) ? ',' : '';
+                                        $formattedFieldValue = $this->formatResponseValue($fieldValue);
+                                        $lines[] = " *     \"{$fieldName}\": {$formattedFieldValue}{$fieldComma}";
+                                    }
+                                    $lines[] = " *   }{$comma}";
+                                } else {
+                                    // Format nested object on multiple lines
+                                    $lines[] = " *   \"{$key}\": {";
+                                    $nestedKeys = array_keys($value);
+                                    $lastNestedKey = end($nestedKeys);
+                                    foreach ($value as $nestedKey => $nestedValue) {
+                                        $nestedComma = ($nestedKey !== $lastNestedKey) ? ',' : '';
+                                        $formattedNestedValue = $this->formatResponseValue($nestedValue);
+                                        $lines[] = " *     \"{$nestedKey}\": {$formattedNestedValue}{$nestedComma}";
+                                    }
+                                    $lines[] = " *   }{$comma}";
                                 }
-                                $lines[] = " *   }{$comma}";
                             } else {
                                 $formattedValue = $this->formatResponseValue($value);
                                 $lines[] = " *   \"{$key}\": {$formattedValue}{$comma}";
@@ -2753,17 +4017,88 @@ class ControllerDocBlockGenerator
     /**
      * Generate response for Eloquent collection (array of models) from Model::get() / Model::all()
      */
-    private function generateCollectionResponse(int $statusCode, array $modelFields): array
+    private function generateCollectionResponse(int $statusCode, array $modelFields, array $eagerRelations = []): array
     {
         $lines = [];
-        $timestamp = $this->faker->dateTimeThisYear()->format('Y-m-d\TH:i:s.000000\Z');
 
         $lines[] = " * @response {$statusCode} [";
         $lines[] = ' *   {';
 
         if (! empty($modelFields)) {
-            $fieldLines = $this->generateModelFieldLines($modelFields, '    ');
+            $fieldLines = $this->generateModelFieldLines($modelFields, '    ', ! empty($eagerRelations));
             $lines = array_merge($lines, $fieldLines);
+        } else {
+            $lines[] = ' *     "id": 1,';
+            $lines[] = ' *     "name": "Example"';
+        }
+
+        // Add eager-loaded relations
+        if (! empty($eagerRelations)) {
+            $this->addEagerRelationsToResponse($lines, $eagerRelations, '    ');
+        }
+
+        $lines[] = ' *   }';
+        $lines[] = ' * ]';
+        $lines[] = ' *';
+
+        return $lines;
+    }
+
+    /**
+     * Add eager-loaded relations to response with nested structure
+     */
+    private function addEagerRelationsToResponse(array &$lines, array $relations, string $indent): void
+    {
+        $relationNames = array_keys($relations);
+        $lastRelation = end($relationNames);
+
+        foreach ($relations as $relationName => $relationData) {
+            $isMany = in_array($relationData['type'] ?? 'hasMany', ['hasMany', 'belongsToMany', 'morphMany', 'morphToMany']);
+            $isLast = ($relationName === $lastRelation);
+            $comma = $isLast ? '' : ',';
+            $fields = $relationData['fields'] ?? [];
+            $nested = $relationData['nested'] ?? [];
+
+            if ($isMany) {
+                $lines[] = " *{$indent}\"{$relationName}\": [";
+                $lines[] = " *{$indent}  {";
+                $this->addFormattedFieldLines($lines, $fields, $indent.'    ', ! empty($nested));
+                if (! empty($nested)) {
+                    $this->addEagerRelationsToResponse($lines, $nested, $indent.'    ');
+                }
+                $lines[] = " *{$indent}  }";
+                $lines[] = " *{$indent}]{$comma}";
+            } else {
+                $lines[] = " *{$indent}\"{$relationName}\": {";
+                $this->addFormattedFieldLines($lines, $fields, $indent.'  ', ! empty($nested));
+                if (! empty($nested)) {
+                    $this->addEagerRelationsToResponse($lines, $nested, $indent.'  ');
+                }
+                $lines[] = " *{$indent}}{$comma}";
+            }
+        }
+    }
+
+    /**
+     * Generate response for mapped collection (transformed with ->map())
+     * This handles patterns like: $collection->map(function($item) { return ['id' => ..., 'name' => ...]; })
+     */
+    private function generateMappedCollectionResponse(int $statusCode, array $fields): array
+    {
+        $lines = [];
+
+        $lines[] = " * @response {$statusCode} [";
+        $lines[] = ' *   {';
+
+        if (! empty($fields)) {
+            $fieldKeys = array_keys($fields);
+            $lastKey = end($fieldKeys);
+
+            foreach ($fields as $fieldName => $fieldType) {
+                $comma = ($fieldName !== $lastKey) ? ',' : '';
+                $exampleValue = $this->generateExampleValueForMappedField($fieldName, $fieldType);
+                $lines[] = " *    \"{$fieldName}\": {$exampleValue}{$comma}";
+            }
         } else {
             $lines[] = ' *     "id": 1,';
             $lines[] = ' *     "name": "Example"';
@@ -2777,17 +4112,233 @@ class ControllerDocBlockGenerator
     }
 
     /**
-     * Generate response for single Eloquent model from Model::findOrFail() / Model::find()
+     * Generate example value for a mapped field based on field name and type
      */
-    private function generateSingleModelResponse(int $statusCode, array $modelFields): array
+    private function generateExampleValueForMappedField(string $fieldName, string $fieldType): string
+    {
+        $fieldLower = strtolower($fieldName);
+
+        // Generate appropriate example value based on type and field name
+        return match ($fieldType) {
+            'integer' => $this->generateIntegerExample($fieldLower),
+            'boolean' => 'true',
+            'number' => '"99.99"',
+            'datetime' => '"'.date('Y-m-d\TH:i:s').'"',
+            default => $this->generateStringExample($fieldLower),
+        };
+    }
+
+    /**
+     * Generate integer example based on field name
+     */
+    private function generateIntegerExample(string $fieldLower): string
+    {
+        if (str_contains($fieldLower, 'id')) {
+            return '1';
+        }
+        if (str_contains($fieldLower, 'total') || str_contains($fieldLower, 'count')) {
+            return (string) $this->faker->numberBetween(0, 100);
+        }
+
+        return (string) $this->faker->numberBetween(1, 999);
+    }
+
+    /**
+     * Generate string example based on field name
+     */
+    private function generateStringExample(string $fieldLower): string
+    {
+        if (str_contains($fieldLower, 'name') || str_contains($fieldLower, 'nome')) {
+            return '"'.$this->faker->words(2, true).'"';
+        }
+        if (str_contains($fieldLower, 'email')) {
+            return '"'.$this->faker->email().'"';
+        }
+        if (str_contains($fieldLower, 'phone') || str_contains($fieldLower, 'telefono')) {
+            return '"'.$this->faker->phoneNumber().'"';
+        }
+        if (str_contains($fieldLower, 'description') || str_contains($fieldLower, 'descrizione')) {
+            return '"'.$this->faker->sentence(5).'"';
+        }
+
+        return '"'.$this->faker->word().'"';
+    }
+
+    /**
+     * Generate response for single API Resource
+     */
+    private function generateApiResourceResponse(int $statusCode, array $fields): array
+    {
+        $lines = [];
+
+        $lines[] = " * @response {$statusCode} {";
+        $lines[] = ' *   "data": {';
+
+        if (! empty($fields)) {
+            $fieldKeys = array_keys($fields);
+            $lastKey = end($fieldKeys);
+
+            foreach ($fields as $fieldName => $fieldValue) {
+                $comma = ($fieldName !== $lastKey) ? ',' : '';
+                $formattedValue = $this->formatApiResourceFieldValue($fieldName, $fieldValue);
+                $lines[] = " *     \"{$fieldName}\": {$formattedValue}{$comma}";
+            }
+        } else {
+            $lines[] = ' *     "id": 1,';
+            $lines[] = ' *     "name": "Example"';
+        }
+
+        $lines[] = ' *   }';
+        $lines[] = ' * }';
+        $lines[] = ' *';
+
+        return $lines;
+    }
+
+    /**
+     * Generate response for API Resource collection
+     */
+    private function generateApiResourceCollectionResponse(int $statusCode, array $fields): array
+    {
+        $lines = [];
+
+        $lines[] = " * @response {$statusCode} {";
+        $lines[] = ' *   "data": [';
+        $lines[] = ' *     {';
+
+        if (! empty($fields)) {
+            $fieldKeys = array_keys($fields);
+            $lastKey = end($fieldKeys);
+
+            foreach ($fields as $fieldName => $fieldValue) {
+                $comma = ($fieldName !== $lastKey) ? ',' : '';
+                $formattedValue = $this->formatApiResourceFieldValue($fieldName, $fieldValue);
+                $lines[] = " *       \"{$fieldName}\": {$formattedValue}{$comma}";
+            }
+        } else {
+            $lines[] = ' *       "id": 1,';
+            $lines[] = ' *       "name": "Example"';
+        }
+
+        $lines[] = ' *     }';
+        $lines[] = ' *   ]';
+        $lines[] = ' * }';
+        $lines[] = ' *';
+
+        return $lines;
+    }
+
+    /**
+     * Generate response for paginated API Resource collection
+     */
+    private function generateApiResourcePaginatedResponse(int $statusCode, array $fields): array
+    {
+        $lines = [];
+
+        $lines[] = " * @response {$statusCode} {";
+        $lines[] = ' *   "data": [';
+        $lines[] = ' *     {';
+
+        if (! empty($fields)) {
+            $fieldKeys = array_keys($fields);
+            $lastKey = end($fieldKeys);
+
+            foreach ($fields as $fieldName => $fieldValue) {
+                $comma = ($fieldName !== $lastKey) ? ',' : '';
+                $formattedValue = $this->formatApiResourceFieldValue($fieldName, $fieldValue);
+                $lines[] = " *       \"{$fieldName}\": {$formattedValue}{$comma}";
+            }
+        } else {
+            $lines[] = ' *       "id": 1,';
+            $lines[] = ' *       "name": "Example"';
+        }
+
+        $lines[] = ' *     }';
+        $lines[] = ' *   ],';
+        $lines[] = ' *   "links": {';
+        $lines[] = ' *     "first": "http://example.com/api/resource?page=1",';
+        $lines[] = ' *     "last": "http://example.com/api/resource?page='.$this->faker->numberBetween(5, 20).'",';
+        $lines[] = ' *     "prev": null,';
+        $lines[] = ' *     "next": "http://example.com/api/resource?page=2"';
+        $lines[] = ' *   },';
+        $lines[] = ' *   "meta": {';
+        $lines[] = ' *     "current_page": 1,';
+        $lines[] = ' *     "from": 1,';
+        $lines[] = ' *     "last_page": '.$this->faker->numberBetween(5, 20).',';
+        $lines[] = ' *     "per_page": 15,';
+        $lines[] = ' *     "to": 15,';
+        $lines[] = ' *     "total": '.$this->faker->numberBetween(50, 200);
+        $lines[] = ' *   }';
+        $lines[] = ' * }';
+        $lines[] = ' *';
+
+        return $lines;
+    }
+
+    /**
+     * Format API Resource field value for documentation
+     */
+    private function formatApiResourceFieldValue(string $fieldName, mixed $fieldValue): string
+    {
+        // Handle special resource field types
+        if (is_array($fieldValue)) {
+            // whenLoaded relation
+            if (isset($fieldValue['_whenLoaded'])) {
+                return '{...}';  // Conditional relation
+            }
+            // Nested resource
+            if (isset($fieldValue['_resource'])) {
+                return '{...}';  // Nested object
+            }
+            // Resource collection
+            if (isset($fieldValue['_resource_collection'])) {
+                return '[...]';  // Array of objects
+            }
+            // Conditional field
+            if (isset($fieldValue['_conditional'])) {
+                return 'null';
+            }
+        }
+
+        // Use the value directly if it's a string/int/bool
+        if (is_scalar($fieldValue)) {
+            return $this->formatResponseValue($fieldValue);
+        }
+
+        // Infer from field name
+        return $this->formatResponseValue($this->inferFieldTypeFromName($fieldName));
+    }
+
+    /**
+     * Generate response for single Eloquent model from Model::findOrFail() / Model::find() / ->load()
+     */
+    private function generateSingleModelResponse(int $statusCode, array $modelFields, array $eagerRelations = []): array
     {
         $lines = [];
 
         $lines[] = " * @response {$statusCode} {";
 
         if (! empty($modelFields)) {
-            $fieldLines = $this->generateModelFieldLines($modelFields, '  ');
-            $lines = array_merge($lines, $fieldLines);
+            // Check if we have relations loaded (either from metadata or passed eager relations)
+            $hasRelations = ! empty($this->metadata['model_relations']) || ! empty($eagerRelations);
+
+            $fieldKeys = array_keys($modelFields);
+            $lastKey = end($fieldKeys);
+
+            foreach ($modelFields as $field => $value) {
+                // Add comma if not last field, or if we have relations to add after
+                $comma = ($field !== $lastKey || $hasRelations) ? ',' : '';
+                $formattedValue = $this->formatResponseValue($value);
+                $lines[] = " *  \"{$field}\": {$formattedValue}{$comma}";
+            }
+
+            // Add loaded relations to the response
+            // Prefer passed eagerRelations (from ->load() parsing) over metadata
+            if (! empty($eagerRelations)) {
+                $this->addEagerRelationsToResponse($lines, $eagerRelations, ' ');
+            } elseif (! empty($this->metadata['model_relations'])) {
+                $this->addRelationsToResponse($lines, ' ');
+            }
         } else {
             $lines[] = ' *   "id": 1,';
             $lines[] = ' *   "name": "Example"';
@@ -2802,14 +4353,16 @@ class ControllerDocBlockGenerator
     /**
      * Generate field lines for model response documentation
      */
-    private function generateModelFieldLines(array $fields, string $indent): array
+    private function generateModelFieldLines(array $fields, string $indent, bool $hasMoreContent = false): array
     {
         $lines = [];
         $fieldKeys = array_keys($fields);
         $lastKey = end($fieldKeys);
 
         foreach ($fields as $field => $value) {
-            $comma = ($field !== $lastKey) ? ',' : '';
+            // Add comma if not last field OR if there's more content coming (relations)
+            $isLastField = ($field === $lastKey);
+            $comma = (! $isLastField || $hasMoreContent) ? ',' : '';
             $formattedValue = $this->formatResponseValue($value);
             $lines[] = " *{$indent}\"{$field}\": {$formattedValue}{$comma}";
         }
@@ -2852,6 +4405,80 @@ class ControllerDocBlockGenerator
         $lines[] = ' *     "to": 15,';
         $lines[] = ' *     "total": '.$this->faker->numberBetween(50, 200);
         $lines[] = ' *   }';
+        $lines[] = ' * }';
+        $lines[] = ' *';
+
+        return $lines;
+    }
+
+    /**
+     * Generate response for simplePaginate results (no total count, more efficient)
+     */
+    private function generateSimplePaginatedResponse(int $statusCode, array $modelFields): array
+    {
+        $lines = [];
+
+        $lines[] = " * @response {$statusCode} {";
+        $lines[] = ' *   "data": [';
+        $lines[] = ' *     {';
+
+        if (! empty($modelFields)) {
+            $fieldLines = $this->generateModelFieldLines($modelFields, '      ');
+            $lines = array_merge($lines, $fieldLines);
+        } else {
+            $lines[] = ' *       "id": 1,';
+            $lines[] = ' *       "name": "Example"';
+        }
+
+        $lines[] = ' *     }';
+        $lines[] = ' *   ],';
+        $lines[] = ' *   "links": {';
+        $lines[] = ' *     "first": "http://example.com/api/resource?page=1",';
+        $lines[] = ' *     "last": null,';
+        $lines[] = ' *     "prev": null,';
+        $lines[] = ' *     "next": "http://example.com/api/resource?page=2"';
+        $lines[] = ' *   },';
+        $lines[] = ' *   "meta": {';
+        $lines[] = ' *     "current_page": 1,';
+        $lines[] = ' *     "from": 1,';
+        $lines[] = ' *     "path": "http://example.com/api/resource",';
+        $lines[] = ' *     "per_page": 15,';
+        $lines[] = ' *     "to": 15';
+        $lines[] = ' *   }';
+        $lines[] = ' * }';
+        $lines[] = ' *';
+
+        return $lines;
+    }
+
+    /**
+     * Generate response for cursorPaginate results (cursor-based pagination)
+     */
+    private function generateCursorPaginatedResponse(int $statusCode, array $modelFields): array
+    {
+        $lines = [];
+        $cursor = base64_encode(json_encode(['id' => $this->faker->numberBetween(10, 100)]));
+
+        $lines[] = " * @response {$statusCode} {";
+        $lines[] = ' *   "data": [';
+        $lines[] = ' *     {';
+
+        if (! empty($modelFields)) {
+            $fieldLines = $this->generateModelFieldLines($modelFields, '      ');
+            $lines = array_merge($lines, $fieldLines);
+        } else {
+            $lines[] = ' *       "id": 1,';
+            $lines[] = ' *       "name": "Example"';
+        }
+
+        $lines[] = ' *     }';
+        $lines[] = ' *   ],';
+        $lines[] = ' *   "path": "http://example.com/api/resource",';
+        $lines[] = ' *   "per_page": 15,';
+        $lines[] = ' *   "next_cursor": "'.$cursor.'",';
+        $lines[] = ' *   "next_page_url": "http://example.com/api/resource?cursor='.$cursor.'",';
+        $lines[] = ' *   "prev_cursor": null,';
+        $lines[] = ' *   "prev_page_url": null';
         $lines[] = ' * }';
         $lines[] = ' *';
 
@@ -2981,6 +4608,19 @@ class ControllerDocBlockGenerator
         } else {
             $lines[] = " * @response {$statusCode} ".$this->faker->numberBetween(1, 100);
         }
+        $lines[] = ' *';
+
+        return $lines;
+    }
+
+    /**
+     * Generate response for binary file download (response()->download())
+     */
+    private function generateBinaryDownloadResponse(int $statusCode): array
+    {
+        $lines = [];
+
+        $lines[] = " * @response {$statusCode} scenario=\"File download\" Binary file content (application/octet-stream)";
         $lines[] = ' *';
 
         return $lines;
@@ -3369,16 +5009,22 @@ class ControllerDocBlockGenerator
 
             case 'store':
             case 'create':
+                $relationNames = array_keys($this->metadata['model_relations'] ?? []);
                 $lines[] = " * @response {$successStatus} {";
                 $lines[] = ' *   "id": '.$this->faker->numberBetween(1, 100).',';
                 foreach ($fieldsToUse as $field => $type) {
                     if ($field === 'id' || $field === 'created_at' || $field === 'updated_at') {
                         continue;
                     }
+                    // Skip fields that are relations (will be added by addRelationsToResponse)
+                    if (in_array($field, $relationNames)) {
+                        continue;
+                    }
                     $example = $this->generateFakerExample($field, $type, '');
                     $value = $this->formatJsonValue($example, $type);
                     $lines[] = " *   \"{$field}\": {$value},";
                 }
+                $this->addRelationsToResponse($lines, '  ');
                 $lines[] = " *   \"created_at\": \"{$timestamp}\"";
                 $lines[] = ' * }';
                 $lines[] = ' *';
@@ -3386,16 +5032,22 @@ class ControllerDocBlockGenerator
 
             case 'update':
             case 'edit':
+                $relationNames = array_keys($this->metadata['model_relations'] ?? []);
                 $lines[] = " * @response {$successStatus} {";
                 $lines[] = ' *   "id": '.$this->faker->numberBetween(1, 100).',';
                 foreach ($fieldsToUse as $field => $type) {
                     if ($field === 'id' || $field === 'created_at' || $field === 'updated_at') {
                         continue;
                     }
+                    // Skip fields that are relations (will be added by addRelationsToResponse)
+                    if (in_array($field, $relationNames)) {
+                        continue;
+                    }
                     $example = $this->generateFakerExample($field, $type, '');
                     $value = $this->formatJsonValue($example, $type);
                     $lines[] = " *   \"{$field}\": {$value},";
                 }
+                $this->addRelationsToResponse($lines, '  ');
                 $lines[] = " *   \"updated_at\": \"{$timestamp}\"";
                 $lines[] = ' * }';
                 $lines[] = ' *';
@@ -3403,10 +5055,29 @@ class ControllerDocBlockGenerator
 
             case 'destroy':
             case 'delete':
-                $lines[] = " * @response {$successStatus} {";
-                $lines[] = " *   \"message\": \"{$resourceName} deleted successfully\"";
-                $lines[] = ' * }';
-                $lines[] = ' *';
+                // First, try to detect actual response from code
+                // Pattern: return response()->json("string", statusCode) - returns plain string
+                if (preg_match('/return\s+response\(\)\s*->\s*json\s*\(\s*["\']([^"\']+)["\']\s*,\s*(\d{3})\s*\)\s*;/s', $this->methodContent, $stringMatch)) {
+                    $message = $stringMatch[1];
+                    $actualStatus = (int) $stringMatch[2];
+                    $lines[] = " * @response {$actualStatus} \"{$message}\"";
+                    $lines[] = ' *';
+                }
+                // Pattern: return response()->json(null, 204)
+                elseif (preg_match('/return\s+response\(\)\s*->\s*json\s*\(\s*null\s*,\s*204\s*\)\s*;/s', $this->methodContent)) {
+                    $lines[] = ' * @response 204 scenario="Resource deleted successfully"';
+                    $lines[] = ' *';
+                }
+                // 204 No Content should not have a body per HTTP specification
+                elseif ($successStatus === 204) {
+                    $lines[] = ' * @response 204 scenario="Resource deleted successfully"';
+                    $lines[] = ' *';
+                } else {
+                    $lines[] = " * @response {$successStatus} {";
+                    $lines[] = " *   \"message\": \"{$resourceName} deleted successfully\"";
+                    $lines[] = ' * }';
+                    $lines[] = ' *';
+                }
                 break;
 
             default:
@@ -3567,21 +5238,266 @@ class ControllerDocBlockGenerator
             return;
         }
 
+        $relationNames = array_keys($this->metadata['model_relations']);
+        $lastRelation = end($relationNames);
+
         foreach ($this->metadata['model_relations'] as $relationName => $relationType) {
             // Determine if it's a to-many or to-one relation
             $isMany = in_array($relationType, ['hasMany', 'belongsToMany', 'morphMany', 'morphToMany', 'morphedByMany', 'loaded']);
+            $isLast = ($relationName === $lastRelation);
+            $comma = $isLast ? '' : ',';
+
+            // Try to get the related model's fields
+            $relatedFields = $this->getRelatedModelFields($relationName);
 
             if ($isMany) {
-                // Array of objects
+                // Array of objects - format on multiple lines
                 $lines[] = " *{$indent}\"{$relationName}\": [";
-                $lines[] = " *{$indent}  {\"id\": ".$this->faker->numberBetween(1, 50).', "name": "'.$this->faker->word().'"},';
-                $lines[] = " *{$indent}  {\"id\": ".$this->faker->numberBetween(51, 100).', "name": "'.$this->faker->word().'"}';
-                $lines[] = " *{$indent}],";
+                $lines[] = " *{$indent}  {";
+                $this->addFormattedFieldLines($lines, $relatedFields, $indent.'    ');
+                $lines[] = " *{$indent}  },";
+                $lines[] = " *{$indent}  {";
+                // Generate new fake values for second item
+                $relatedFields2 = $this->getRelatedModelFields($relationName);
+                $this->addFormattedFieldLines($lines, $relatedFields2, $indent.'    ');
+                $lines[] = " *{$indent}  }";
+                $lines[] = " *{$indent}]{$comma}";
             } else {
-                // Single object
-                $lines[] = " *{$indent}\"{$relationName}\": {\"id\": ".$this->faker->numberBetween(1, 100).', "name": "'.$this->faker->word().'"},';
+                // Single object - format on multiple lines
+                $lines[] = " *{$indent}\"{$relationName}\": {";
+                $this->addFormattedFieldLines($lines, $relatedFields, $indent.'  ');
+                $lines[] = " *{$indent}}{$comma}";
             }
         }
+    }
+
+    /**
+     * Add formatted field lines for a model/relation
+     */
+    private function addFormattedFieldLines(array &$lines, array $fields, string $indent, bool $hasMoreContent = false): void
+    {
+        $fieldNames = array_keys($fields);
+        $lastField = end($fieldNames);
+
+        foreach ($fields as $key => $value) {
+            $isLastField = ($key === $lastField);
+            // Add comma if not last field OR if there's more content coming (nested relations)
+            $comma = (! $isLastField || $hasMoreContent) ? ',' : '';
+
+            if (is_string($value)) {
+                $lines[] = " *{$indent}\"{$key}\": \"{$value}\"{$comma}";
+            } elseif (is_bool($value)) {
+                $lines[] = " *{$indent}\"{$key}\": ".($value ? 'true' : 'false')."{$comma}";
+            } elseif (is_null($value)) {
+                $lines[] = " *{$indent}\"{$key}\": null{$comma}";
+            } else {
+                $lines[] = " *{$indent}\"{$key}\": {$value}{$comma}";
+            }
+        }
+    }
+
+    /**
+     * Get fields from a related model by looking at the relation definition
+     */
+    private function getRelatedModelFields(string $relationName): array
+    {
+        // Try to find the model class from the current model's relation
+        if (! empty($this->metadata['model_class'])) {
+            $modelClass = $this->metadata['model_class'];
+            $namespaces = ['App\\Models\\', 'App\\'];
+
+            foreach ($namespaces as $namespace) {
+                $fullClass = $namespace.$modelClass;
+                if (class_exists($fullClass)) {
+                    try {
+                        $reflection = new \ReflectionClass($fullClass);
+                        if ($reflection->hasMethod($relationName)) {
+                            $method = $reflection->getMethod($relationName);
+                            $methodBody = file_get_contents($method->getFileName());
+                            $startLine = $method->getStartLine();
+                            $endLine = $method->getEndLine();
+                            $lines = array_slice(explode("\n", $methodBody), $startLine - 1, $endLine - $startLine + 1);
+                            $relationCode = implode("\n", $lines);
+
+                            // Extract related model class from relation definition
+                            // Pattern: belongsToMany(User::class, ...) or hasMany(Patient::class)
+                            if (preg_match('/(?:belongsToMany|hasMany|hasOne|belongsTo|morphMany|morphOne)\s*\(\s*([A-Z][a-zA-Z0-9_]*)::class/', $relationCode, $match)) {
+                                $relatedModel = $match[1];
+
+                                return $this->extractModelFields($relatedModel);
+                            }
+                        }
+                    } catch (\Exception $e) {
+                        // Fall through to default
+                    }
+                }
+            }
+        }
+
+        // Fallback: try to guess model from relation name (singular form)
+        $guessedModel = ucfirst(rtrim($relationName, 's'));
+        $fields = $this->extractModelFields($guessedModel);
+        if (! empty($fields)) {
+            return $fields;
+        }
+
+        // Default fallback
+        return [
+            'id' => $this->faker->numberBetween(1, 100),
+            'name' => $this->faker->word(),
+        ];
+    }
+
+    /**
+     * Parse eager load relations from with() call content
+     * Handles: with('rel1', 'rel2'), with(['rel1', 'rel2']), with('rel1.nested')
+     */
+    private function parseEagerLoadRelations(string $withContent, string $modelClass): array
+    {
+        $relations = [];
+
+        // First, remove constraint closures content to avoid picking up select() column names
+        // This removes everything inside function($query) { ... } blocks
+        $cleanedContent = preg_replace('/function\s*\([^)]*\)\s*\{[^}]*\}/s', '', $withContent);
+
+        // Extract relation names from the cleaned content
+        // Supports: 'relation', 'relation.nested', 'relation:col1,col2', 'relation.nested:col1,col2'
+        if (preg_match_all("/['\"]([a-zA-Z_][a-zA-Z0-9_.:,]*)['\"]/", $cleanedContent, $matches)) {
+            foreach ($matches[1] as $relationPath) {
+                // Remove column selection (e.g., 'user:id,name,surname' -> 'user')
+                // Also handle nested relations with column selection (e.g., 'posts.comments:id,body')
+                $cleanPath = preg_replace('/:[\w,]+/', '', $relationPath);
+
+                // Handle nested relations like 'questionnaires.answers'
+                $parts = explode('.', $cleanPath);
+                $this->buildNestedRelationStructure($relations, $parts, $modelClass);
+            }
+        }
+
+        return $relations;
+    }
+
+    /**
+     * Build nested relation structure recursively
+     */
+    private function buildNestedRelationStructure(array &$relations, array $parts, string $currentModelClass): void
+    {
+        if (empty($parts)) {
+            return;
+        }
+
+        $relationName = array_shift($parts);
+
+        if (! isset($relations[$relationName])) {
+            // Get the related model class and its fields
+            $relatedModelClass = $this->getRelatedModelClass($currentModelClass, $relationName);
+            $relatedFields = $relatedModelClass ? $this->extractModelFields($relatedModelClass) : [];
+            $relationType = $this->getRelationType($currentModelClass, $relationName);
+
+            $relations[$relationName] = [
+                'model' => $relatedModelClass,
+                'type' => $relationType,
+                'fields' => $relatedFields,
+                'nested' => [],
+            ];
+        }
+
+        // Recurse for nested relations
+        if (! empty($parts) && $relations[$relationName]['model']) {
+            $this->buildNestedRelationStructure(
+                $relations[$relationName]['nested'],
+                $parts,
+                $relations[$relationName]['model']
+            );
+        }
+    }
+
+    /**
+     * Get the related model class name from a relation method
+     */
+    private function getRelatedModelClass(string $modelClass, string $relationName): ?string
+    {
+        $namespaces = ['App\\Models\\', 'App\\'];
+
+        foreach ($namespaces as $namespace) {
+            $fullClass = $namespace.$modelClass;
+            if (class_exists($fullClass)) {
+                try {
+                    $reflection = new \ReflectionClass($fullClass);
+                    if ($reflection->hasMethod($relationName)) {
+                        $method = $reflection->getMethod($relationName);
+                        $methodBody = file_get_contents($method->getFileName());
+                        $startLine = $method->getStartLine();
+                        $endLine = $method->getEndLine();
+                        $lines = array_slice(explode("\n", $methodBody), $startLine - 1, $endLine - $startLine + 1);
+                        $relationCode = implode("\n", $lines);
+
+                        if (preg_match('/(?:belongsToMany|hasMany|hasOne|belongsTo|morphMany|morphOne|morphToMany)\s*\(\s*([A-Z][a-zA-Z0-9_]*)::class/', $relationCode, $match)) {
+                            return $match[1];
+                        }
+                    }
+                } catch (\Exception $e) {
+                    // Fall through
+                }
+            }
+        }
+
+        // Fallback: guess from relation name
+        return ucfirst(rtrim($relationName, 's'));
+    }
+
+    /**
+     * Get the relation type (hasMany, belongsTo, etc.)
+     */
+    private function getRelationType(string $modelClass, string $relationName): string
+    {
+        $namespaces = ['App\\Models\\', 'App\\'];
+
+        foreach ($namespaces as $namespace) {
+            $fullClass = $namespace.$modelClass;
+            if (class_exists($fullClass)) {
+                try {
+                    $reflection = new \ReflectionClass($fullClass);
+                    if ($reflection->hasMethod($relationName)) {
+                        $method = $reflection->getMethod($relationName);
+                        $methodBody = file_get_contents($method->getFileName());
+                        $startLine = $method->getStartLine();
+                        $endLine = $method->getEndLine();
+                        $lines = array_slice(explode("\n", $methodBody), $startLine - 1, $endLine - $startLine + 1);
+                        $relationCode = implode("\n", $lines);
+
+                        if (preg_match('/(belongsToMany|hasMany|hasOne|belongsTo|morphMany|morphOne|morphToMany)\s*\(/', $relationCode, $match)) {
+                            return $match[1];
+                        }
+                    }
+                } catch (\Exception $e) {
+                    // Fall through
+                }
+            }
+        }
+
+        return 'hasMany'; // Default assumption
+    }
+
+    /**
+     * Format related model fields as JSON string
+     */
+    private function formatRelatedModelJson(array $fields): string
+    {
+        $parts = [];
+        foreach ($fields as $key => $value) {
+            if (is_string($value)) {
+                $parts[] = '"'.$key.'": "'.$value.'"';
+            } elseif (is_bool($value)) {
+                $parts[] = '"'.$key.'": '.($value ? 'true' : 'false');
+            } elseif (is_null($value)) {
+                $parts[] = '"'.$key.'": null';
+            } else {
+                $parts[] = '"'.$key.'": '.$value;
+            }
+        }
+
+        return '{'.implode(', ', $parts).'}';
     }
 
     /**
@@ -3696,21 +5612,73 @@ class ControllerDocBlockGenerator
      */
     private function detectHttpMethod(): string
     {
-        if (preg_match('/POST|POST|store|create|add/i', $this->methodName)) {
+        // First, try to get the actual HTTP method from Laravel's router
+        $routeMethod = $this->findRouteHttpMethod();
+        if ($routeMethod !== null) {
+            return $routeMethod;
+        }
+
+        // Fallback: detect from method name patterns
+        if (preg_match('/^(store|create|add|attach|sync|assign|register|submit)/i', $this->methodName)) {
             return 'POST';
         }
-        if (preg_match('/PUT|PATCH|update|edit/i', $this->methodName)) {
+        if (preg_match('/^(update|edit|patch|modify|change)/i', $this->methodName)) {
             return 'PUT';
         }
-        if (preg_match('/DELETE|destroy|delete|remove/i', $this->methodName)) {
+        if (preg_match('/^(destroy|delete|remove|detach|unassign|revoke)/i', $this->methodName)) {
             return 'DELETE';
         }
 
         return 'GET';
     }
 
+    /**
+     * Find the actual HTTP method from Laravel's router for this controller method.
+     */
+    private function findRouteHttpMethod(): ?string
+    {
+        try {
+            $routes = app('router')->getRoutes();
+
+            foreach ($routes as $route) {
+                $action = $route->getAction();
+
+                // Check if the route uses this controller and method
+                if (isset($action['controller'])) {
+                    $controllerAction = $action['controller'];
+
+                    // Format: App\Http\Controllers\UserController@show
+                    if (str_contains($controllerAction, '@')) {
+                        [$controllerClass, $methodName] = explode('@', $controllerAction);
+
+                        if ($controllerClass === $this->controllerClass && $methodName === $this->methodName) {
+                            $methods = $route->methods();
+                            // Return first non-HEAD method
+                            foreach ($methods as $method) {
+                                if ($method !== 'HEAD') {
+                                    return strtoupper($method);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            // Silent fail - will use fallback detection
+        }
+
+        return null;
+    }
+
     private function detectEndpoint(): string
     {
+        // Try to find the actual route from Laravel's router
+        $realEndpoint = $this->findRouteForControllerMethod();
+        if ($realEndpoint !== null) {
+            return $realEndpoint;
+        }
+
+        // Fallback to guessing based on controller name (legacy behavior)
         $resource = strtolower($this->getResourceNamePlural());
 
         if (in_array($this->methodName, ['index', 'store'])) {
@@ -3721,6 +5689,60 @@ class ControllerDocBlockGenerator
         }
 
         return "/api/{$resource}/".strtolower($this->methodName);
+    }
+
+    /**
+     * Find the actual route URI for this controller method from Laravel's router.
+     *
+     * @return string|null The route URI with parameter placeholders, or null if not found
+     */
+    private function findRouteForControllerMethod(): ?string
+    {
+        try {
+            $routes = app('router')->getRoutes();
+
+            foreach ($routes as $route) {
+                $action = $route->getAction();
+
+                // Check if the route uses this controller and method
+                if (isset($action['controller'])) {
+                    $controllerAction = $action['controller'];
+
+                    // Format: App\Http\Controllers\Api\PatientNoteController@index
+                    $expectedAction = $this->controllerClass.'@'.$this->methodName;
+
+                    if ($controllerAction === $expectedAction) {
+                        $uri = $route->uri();
+
+                        // Ensure it starts with /
+                        if (! str_starts_with($uri, '/')) {
+                            $uri = '/'.$uri;
+                        }
+
+                        return $uri;
+                    }
+                }
+
+                // Also check uses array format (for some route definitions)
+                if (isset($action['uses']) && is_string($action['uses'])) {
+                    $expectedAction = $this->controllerClass.'@'.$this->methodName;
+
+                    if ($action['uses'] === $expectedAction) {
+                        $uri = $route->uri();
+
+                        if (! str_starts_with($uri, '/')) {
+                            $uri = '/'.$uri;
+                        }
+
+                        return $uri;
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            // If we can't access the router (e.g., running outside Laravel context), fall back to guessing
+        }
+
+        return null;
     }
 
     private function getTitleForMethod(): string
@@ -3761,6 +5783,10 @@ class ControllerDocBlockGenerator
     private function inferTypeFromRules(string $rules): string
     {
         if (str_contains($rules, 'integer') || str_contains($rules, 'numeric')) {
+            return 'integer';
+        }
+        // exists:table,column typically refers to an ID (integer)
+        if (preg_match('/exists:\w+,id/', $rules) || preg_match('/exists:\w+$/', $rules)) {
             return 'integer';
         }
         if (str_contains($rules, 'email')) {
