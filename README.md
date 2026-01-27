@@ -1,6 +1,6 @@
 # Lazy Docs - Laravel PHPDoc Generator
 
-🚀 **Automatically generate intelligent, natural-language PHPDoc for your Laravel API controllers** - perfectly compatible with **Laravel Scribe**.
+🚀 **Automatically generate intelligent, natural-language PHPDoc for your Laravel API controllers** - perfectly compatible with **Laravel Scribe**
 
 ## Features
 
